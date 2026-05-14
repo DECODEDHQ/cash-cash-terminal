@@ -1,0 +1,53 @@
+{
+  "system": "SPIDERNODE_CASHCASH_BRIDGE",
+  "mode": "NON_DESTRUCTIVE_CONNECTIVE_LAYER",
+  "cashcash": {
+    "url": "https://cash-cash-terminal.onrender.com",
+    "role": "money-machine-figment-terminal"
+  },
+  "routes": {
+    "dreammaker": {
+      "label": "DreamMaker",
+      "role": "custom figment manifestation",
+      "url": "UNSET"
+    },
+    "earn_agency": {
+      "label": "Earn Agency",
+      "role": "done-for-you deployment and marketing",
+      "url": "https://earnagency.d-apps.store"
+    },
+    "earn_ai": {
+      "label": "Earn AI",
+      "role": "AI income and automation surface",
+      "url": "https://earnai.d-apps.store"
+    },
+    "corporate_hq": {
+      "label": "Damon YLF Corporate HQ",
+      "role": "enterprise, licensing, investor, partnership routing",
+      "url": "https://damonylf.decodedworld.xyz"
+    },
+    "consultation": {
+      "label": "Monetizing Imagination",
+      "role": "personal consultation and founder advisory",
+      "url": "https://monetizingimagination.d-apps.store"
+    },
+    "local_chairman": {
+      "label": "Chairman CNS Local",
+      "role": "local sovereign orchestration",
+      "url": "http://127.0.0.1:58195"
+    }
+  },
+  "figment_language_law": {
+    "public_product_word": "Figment",
+    "never_public": ["node", "mesh internals", "backend", "runtime internals"],
+    "internal_allowed": ["SPIDERNODE", "Nexus Mesh", "Chairman CNS", "DreamMaker"]
+  },
+  "routing_logic": {
+    "money_intent": "CashCash",
+    "custom_intent": "DreamMaker",
+    "done_for_you": "Earn Agency",
+    "consultation": "Monetizing Imagination",
+    "enterprise": "Corporate HQ",
+    "licensing": "Corporate HQ"
+  }
+}

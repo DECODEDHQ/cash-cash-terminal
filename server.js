@@ -106,6 +106,62 @@ cron.schedule("*/1 * * * *", async () => {
   await processQueue();
 });
 
+
+import spiderRegistry from "./spider_registry.json" assert { type: "json" };
+
+app.get("/spider", (_, res) => {
+  res.json(spiderRegistry);
+});
+
+app.get("/routes", (_, res) => {
+  res.json(spiderRegistry.routes);
+});
+
+app.post("/route", (req, res) => {
+  const intent = String(req.body?.intent || "").toLowerCase();
+
+  let route = spiderRegistry.routes.corporate_hq;
+
+  if (intent.includes("money") || intent.includes("cash") || intent.includes("income")) {
+    route = { label: "CashCash", role: "money-machine-figment-terminal", url: spiderRegistry.cashcash.url };
+  } else if (intent.includes("custom") || intent.includes("build") || intent.includes("manifest")) {
+    route = spiderRegistry.routes.dreammaker;
+  } else if (intent.includes("done") || intent.includes("marketing") || intent.includes("agency")) {
+    route = spiderRegistry.routes.earn_agency;
+  } else if (intent.includes("consult")) {
+    route = spiderRegistry.routes.consultation;
+  } else if (intent.includes("license") || intent.includes("enterprise") || intent.includes("investor")) {
+    route = spiderRegistry.routes.corporate_hq;
+  }
+
+  res.json({
+    ok: true,
+    intent,
+    route,
+    product_language: "Figment"
+  });
+});
+
+app.post("/figment", (req, res) => {
+  const name = req.body?.name || "CashCash";
+  const intent = req.body?.intent || "money";
+  const buyer = req.body?.buyer || "there";
+
+  res.json({
+    ok: true,
+    figment: {
+      name,
+      buyer,
+      intent,
+      language: "Figment",
+      activation: "https://buy.stripe.com/4gM3cu5WG1Qz7mzd1AbEA00",
+      consultation: "https://monetizingimagination.d-apps.store",
+      hq: "https://damonylf.decodedworld.xyz"
+    },
+    message: `${buyer}, your ${name} Figment is ready.`
+  });
+});
+
 app.get("/health", (_, res) => {
   res.json({ ok: true, service: "cashcash-cloud-worker" });
 });
