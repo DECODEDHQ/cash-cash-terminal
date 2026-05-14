@@ -1,0 +1,19 @@
+name: CashCash Cloud Pulse
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+jobs:
+  pulse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pulse CashCash Worker
+        run: |
+          curl -sS -X POST https://cash-cash-terminal.onrender.com/activate \
+            -H "Content-Type: application/json" \
+            -d '{"source":"github-actions","mode":"keepalive"}'
+          curl -sS -X POST https://cash-cash-terminal.onrender.com/pulse \
+            -H "Content-Type: application/json" \
+            -d '{"limit":5}'
