@@ -1,0 +1,21 @@
+{
+  "system": "DREAMMAKER_FEDERATION",
+  "mode": "NON_DESTRUCTIVE_MANIFESTATION_LAYER",
+  "principle": "DreamMaker manifests; CashCash routes; Chairman governs.",
+  "routes": {
+    "cashcash": "https://cash-cash-terminal.onrender.com",
+    "earn_agency": "https://earnagency.d-apps.store",
+    "earn_ai": "https://earnai.d-apps.store",
+    "consultation": "https://monetizingimagination.d-apps.store",
+    "corporate_hq": "https://damonylf.decodedworld.xyz",
+    "local_chairman": "http://127.0.0.1:58195",
+    "dreammaker": "UNSET"
+  },
+  "rights_law": {
+    "default": "licensed access only",
+    "spawn_rights": "premium only",
+    "transfer": "not transferable",
+    "source_rights": "not included",
+    "public_product_language": "Figment"
+  }
+}

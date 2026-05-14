@@ -334,6 +334,114 @@ app.post("/bridge-clear", (_, res) => {
 });
 
 
+
+
+const figmentRegistry = [];
+
+function makeFigment(payload = {}) {
+  const id = `fig_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const figment = {
+    id,
+    createdAt: new Date().toISOString(),
+    name: payload.name || "CashCash",
+    buyer: payload.buyer || payload.name || "there",
+    intent: payload.intent || "money",
+    type: payload.type || "Money Machine Figment",
+    status: "manifested_preview",
+    rights: {
+      access: true,
+      commercial: Boolean(payload.commercial),
+      whiteLabel: Boolean(payload.whiteLabel),
+      spawn: Boolean(payload.spawnRightsPaid),
+      transferable: false,
+      sourceIncluded: false
+    },
+    routes: {
+      activation: "https://buy.stripe.com/4gM3cu5WG1Qz7mzd1AbEA00",
+      consultation: "https://monetizingimagination.d-apps.store",
+      earnAgency: "https://earnagency.d-apps.store",
+      earnAI: "https://earnai.d-apps.store",
+      hq: "https://damonylf.decodedworld.xyz"
+    },
+    publicLanguage: {
+      product: "Figment",
+      message: `${payload.buyer || payload.name || "there"}, your ${payload.name || "CashCash"} Figment is ready.`
+    }
+  };
+
+  figmentRegistry.unshift(figment);
+  if (figmentRegistry.length > 500) figmentRegistry.pop();
+  log("FIGMENT_MANIFESTED", { id: figment.id, name: figment.name, intent: figment.intent });
+  return figment;
+}
+
+app.get("/dreammaker", (_, res) => {
+  res.json({
+    ok: true,
+    system: "DreamMaker Federation",
+    mode: "manifestation routing",
+    cashcash: "https://cash-cash-terminal.onrender.com",
+    rule: "Figments are licensed, non-transferable, and spawn rights require paid authorization."
+  });
+});
+
+app.post("/manifest", (req, res) => {
+  const figment = makeFigment(req.body || {});
+  res.json({
+    ok: true,
+    figment,
+    message: figment.publicLanguage.message
+  });
+});
+
+app.post("/spawn-request", (req, res) => {
+  const paid = Boolean(req.body?.spawnRightsPaid);
+
+  if (!paid) {
+    const figment = makeFigment({
+      ...(req.body || {}),
+      spawnRightsPaid: false
+    });
+
+    return res.json({
+      ok: true,
+      approved: false,
+      reason: "SPAWN_RIGHTS_NOT_INCLUDED",
+      route: "https://monetizingimagination.d-apps.store",
+      figment,
+      message: "This Figment can be activated, but self-spawning rights require a Creator or Enterprise license."
+    });
+  }
+
+  const figment = makeFigment({
+    ...(req.body || {}),
+    spawnRightsPaid: true,
+    type: req.body?.type || "Creator Licensed Figment"
+  });
+
+  res.json({
+    ok: true,
+    approved: true,
+    figment,
+    message: "Spawn-capable Figment request approved under paid rights."
+  });
+});
+
+app.get("/figment-registry", (_, res) => {
+  res.json({
+    ok: true,
+    count: figmentRegistry.length,
+    figments: figmentRegistry
+  });
+});
+
+app.get("/figment/:id", (req, res) => {
+  const found = figmentRegistry.find(x => x.id === req.params.id);
+  if (!found) return res.status(404).json({ ok: false, error: "FIGMENT_NOT_FOUND" });
+  res.json({ ok: true, figment: found });
+});
+
+
 app.get("/health", (_, res) => {
   res.json({ ok: true, service: "cashcash-cloud-worker" });
 });
