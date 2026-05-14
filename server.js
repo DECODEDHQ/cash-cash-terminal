@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import nodemailer from "nodemailer";
+import { Resend } from "resend";
 import fs from "fs";
 import path from "path";
 
@@ -94,17 +94,13 @@ function cleanEmail(email = "") {
   return String(email).trim().toLowerCase();
 }
 
+
 function makeTransport() {
-  const user = process.env.SMTP_PRIMARY_USER;
-  const pass = process.env.SMTP_PRIMARY_PASS;
-  if (!user || !pass) return null;
-  return nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT),
-    secure: String(process.env.SMTP_SECURE) === "true",
-    auth: { user, pass }
-  });
+  const key = process.env.RESEND_API_KEY;
+  if (!key) return null;
+  return new Resend(key);
 }
+
 
 function cashcashMessage({ name = "there" }) {
   return `Hi ${name},
@@ -157,13 +153,14 @@ function queueLead(raw = {}) {
   return { ok: true, lead };
 }
 
+
 async function sendLead(lead) {
   const mailer = makeTransport();
-  if (!mailer) throw new Error("SMTP_NOT_CONFIGURED");
+  if (!mailer) throw new Error("RESEND_NOT_CONFIGURED");
 
-  const info = await mailer.sendMail({
-    from: `CashCash <${process.env.SMTP_PRIMARY_USER}>`,
-    to: lead.email,
+  const result = await mailer.emails.send({
+    from: "CashCash <onboarding@resend.dev>",
+    to: [lead.email],
     subject: "Your CashCash Figment is ready",
     text: cashcashMessage(lead)
   });
@@ -171,19 +168,17 @@ async function sendLead(lead) {
   const sent = {
     id: lead.id,
     to: lead.email,
-    name: lead.name,
-    platform: lead.platform,
-    intent: lead.intent,
-    messageId: info.messageId,
+    provider: "resend",
+    messageId: result.data?.id || "queued",
     time: new Date().toISOString()
   };
 
   state.sent.unshift(sent);
-  state.sent = state.sent.slice(0, 1000);
   state.counters.totalSent++;
   log("EMAIL_SENT", sent);
   return sent;
 }
+
 
 async function pulse(limit = 5) {
   if (!state.active) return { ok: false, reason: "MISSION_INACTIVE" };
