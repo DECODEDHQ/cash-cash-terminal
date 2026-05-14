@@ -656,6 +656,153 @@ app.post("/hot-reply", (req, res) => {
 });
 
 
+
+
+const towerCommands = [];
+
+app.get("/tower", (_, res) => {
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>CashCash SPIDERNODE Command Tower</title>
+<style>
+body{margin:0;background:#05070b;color:#eef6ff;font-family:-apple-system,BlinkMacSystemFont,Inter,Arial,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:28px}
+.hero{border:1px solid rgba(120,220,255,.22);border-radius:28px;padding:30px;background:linear-gradient(135deg,rgba(9,14,24,.95),rgba(0,255,240,.05));box-shadow:0 30px 90px rgba(0,0,0,.4)}
+h1{font-size:clamp(38px,7vw,82px);letter-spacing:-.06em;line-height:.9;margin:0}
+p{color:#9fb0c7;line-height:1.55}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:18px}
+.card{border:1px solid rgba(255,255,255,.12);border-radius:22px;background:rgba(255,255,255,.04);padding:18px}
+b{color:#78fff2}
+button{border:0;border-radius:999px;padding:12px 16px;font-weight:800;margin:6px;background:#eef6ff;color:#05070b}
+button.dark{background:transparent;color:#eef6ff;border:1px solid rgba(255,255,255,.2)}
+pre{white-space:pre-wrap;background:#020306;border:1px solid rgba(120,220,255,.18);padding:16px;border-radius:18px;overflow:auto}
+</style>
+</head>
+<body>
+<div class="wrap">
+<section class="hero">
+<div style="font-size:12px;letter-spacing:.2em;color:#78fff2;font-weight:800">SPIDERNODE COMMAND TOWER</div>
+<h1>CashCash<br/>Control Surface</h1>
+<p>Observe, route, pause, resume, export. Non-destructive command tower for the CashCash Figment terminal.</p>
+<button onclick="post('/activate')">Resume Mission</button>
+<button class="dark" onclick="post('/pause')">Pause Mission</button>
+<button class="dark" onclick="post('/tower-export')">Export State</button>
+</section>
+<div class="grid">
+<div class="card"><h3>Status</h3><pre id="state">Loading...</pre></div>
+<div class="card"><h3>Mission</h3><pre id="mission">Loading...</pre></div>
+<div class="card"><h3>Routes</h3><pre id="routes">Loading...</pre></div>
+<div class="card"><h3>Health</h3><pre id="health">Loading...</pre></div>
+</div>
+</div>
+<script>
+async function load(){
+  const s=await fetch('/state').then(r=>r.json()).catch(e=>({error:e.message}));
+  const m=await fetch('/mission').then(r=>r.json()).catch(e=>({error:e.message}));
+  const h=await fetch('/health').then(r=>r.json()).catch(e=>({error:e.message}));
+  let routes={};
+  try{routes=await fetch('/routes').then(r=>r.json())}catch(e){routes={status:'routes not loaded yet'}}
+  state.textContent=JSON.stringify(s,null,2);
+  mission.textContent=JSON.stringify(m,null,2);
+  health.textContent=JSON.stringify(h,null,2);
+  document.getElementById('routes').textContent=JSON.stringify(routes,null,2);
+}
+async function post(path){
+  await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'tower'})});
+  load();
+}
+load(); setInterval(load,10000);
+</script>
+</body></html>`);
+});
+
+app.get("/tower-health", (_, res) => {
+  res.json({
+    ok: true,
+    tower: "SPIDERNODE_COMMAND_TOWER",
+    active: state.active,
+    mission: state.mission,
+    queue: state.queue?.length || 0,
+    sent: state.sent?.length || 0,
+    failed: state.failed?.length || 0,
+    suppressed: state.suppressed?.length || 0,
+    rules: {
+      noOverride: true,
+      noMutationWithoutProtocol: true,
+      operatorSovereignty: true
+    }
+  });
+});
+
+app.get("/tower-dashboard", (_, res) => {
+  res.json({
+    ok: true,
+    dashboard: {
+      mission: state.mission,
+      active: state.active,
+      counters: state.counters || {},
+      queue: state.queue || [],
+      sent: state.sent || [],
+      failed: state.failed || [],
+      suppressed: state.suppressed || [],
+      recentLogs: state.logs || []
+    }
+  });
+});
+
+app.post("/tower-command", (req, res) => {
+  const command = {
+    id: `tower_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+    createdAt: new Date().toISOString(),
+    source: req.body?.source || "tower",
+    intent: req.body?.intent || "unknown",
+    payload: req.body || {},
+    safety: {
+      nonDestructive: true,
+      noOverride: true,
+      noRestart: true
+    },
+    status: "recorded"
+  };
+
+  towerCommands.unshift(command);
+  if (towerCommands.length > 300) towerCommands.pop();
+  log("TOWER_COMMAND", command);
+
+  res.json({ ok: true, command });
+});
+
+app.post("/tower-kill", (req, res) => {
+  state.active = false;
+  log("TOWER_KILL_SWITCH", { source: req.body?.source || "tower" });
+  res.json({ ok: true, active: false, message: "Mission paused by tower kill switch." });
+});
+
+app.post("/tower-resume", (req, res) => {
+  state.active = true;
+  log("TOWER_RESUME", { source: req.body?.source || "tower" });
+  res.json({ ok: true, active: true, message: "Mission resumed by tower." });
+});
+
+app.post("/tower-export", (_, res) => {
+  res.json({
+    ok: true,
+    exportedAt: new Date().toISOString(),
+    mission: state.mission,
+    active: state.active,
+    state,
+    towerCommands
+  });
+});
+
+app.get("/tower-commands", (_, res) => {
+  res.json({ ok: true, count: towerCommands.length, commands: towerCommands });
+});
+
+
 app.get("/health", (_, res) => {
   res.json({ ok: true, service: "cashcash-cloud-worker" });
 });

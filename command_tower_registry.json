@@ -1,0 +1,12 @@
+{
+  "system": "SPIDERNODE_COMMAND_TOWER",
+  "mode": "CONTROL_SURFACE_ONLY",
+  "principle": "observe, route, pause, resume, export — never override",
+  "surfaces": {
+    "cashcash_terminal": "https://cash-cash-terminal.onrender.com",
+    "corporate_hq": "https://damonylf.decodedworld.xyz",
+    "consultation": "https://monetizingimagination.d-apps.store",
+    "earn_agency": "https://earnagency.d-apps.store",
+    "earn_ai": "https://earnai.d-apps.store"
+  }
+}
