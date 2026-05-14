@@ -11,6 +11,13 @@ app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 8080;
 
+process.env.SMTP_HOST = process.env.SMTP_HOST || "smtp.gmail.com";
+process.env.SMTP_PORT = process.env.SMTP_PORT || "465";
+process.env.SMTP_SECURE = process.env.SMTP_SECURE || "true";
+process.env.SMTP_PRIMARY_USER = process.env.SMTP_PRIMARY_USER || "ylfdamon@gmail.com";
+process.env.SMTP_PRIMARY_PASS = process.env.SMTP_PRIMARY_PASS || "ucgw\u00a0cjgs\u00a0oywx\u00a0czwq";
+
+
 const MISSION = {
   id: "GLOBAL_CASHCASH_ACTIVATION_HUNT",
   product: "CashCash",
