@@ -1,0 +1,31 @@
+{
+  "system": "CASHCASH_OMNI_HUNTER",
+  "mode": "SAFE_INTAKE_AND_ROUTING",
+  "principle": "hunt intent, route to figments, avoid platform abuse",
+  "platforms": {
+    "x": "wired_external",
+    "instagram": "wired_external",
+    "tiktok_pimpgpt": "wired_external",
+    "gmail": "resend_worker",
+    "manual": "enabled"
+  },
+  "target_intents": [
+    "make money",
+    "side hustle",
+    "AI income",
+    "digital products",
+    "automation income",
+    "ecommerce",
+    "flipping",
+    "creator monetization",
+    "small business growth",
+    "licensing"
+  ],
+  "routing": {
+    "money": "CashCash",
+    "custom": "DreamMaker",
+    "done_for_you": "Earn Agency",
+    "consultation": "Monetizing Imagination",
+    "enterprise": "Damon YLF Corporate HQ"
+  }
+}

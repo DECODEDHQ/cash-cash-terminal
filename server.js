@@ -442,6 +442,220 @@ app.get("/figment/:id", (req, res) => {
 });
 
 
+
+
+const campaigns = [];
+
+function scoreIntent(text = "") {
+  const t = String(text).toLowerCase();
+  let score = 0;
+  const hits = [];
+
+  const rules = [
+    ["make money", 25],
+    ["side hustle", 20],
+    ["ai income", 25],
+    ["digital product", 20],
+    ["automation", 15],
+    ["ecommerce", 15],
+    ["flipping", 20],
+    ["creator", 10],
+    ["monetize", 20],
+    ["business", 10],
+    ["cash", 25],
+    ["license", 25],
+    ["startup", 10],
+    ["sales", 15],
+    ["leads", 15]
+  ];
+
+  for (const [term, points] of rules) {
+    if (t.includes(term)) {
+      score += points;
+      hits.push(term);
+    }
+  }
+
+  let tier = "cold";
+  if (score >= 50) tier = "hot";
+  else if (score >= 25) tier = "warm";
+
+  return { score, tier, hits };
+}
+
+function routeIntent(text = "") {
+  const t = String(text).toLowerCase();
+
+  if (t.includes("custom") || t.includes("build") || t.includes("manifest")) {
+    return { route: "DreamMaker", url: "https://monetizingimagination.d-apps.store" };
+  }
+
+  if (t.includes("done for you") || t.includes("marketing") || t.includes("agency")) {
+    return { route: "Earn Agency", url: "https://earnagency.d-apps.store" };
+  }
+
+  if (t.includes("consult")) {
+    return { route: "Monetizing Imagination", url: "https://monetizingimagination.d-apps.store" };
+  }
+
+  if (t.includes("license") || t.includes("enterprise") || t.includes("partner")) {
+    return { route: "Corporate HQ", url: "https://damonylf.decodedworld.xyz" };
+  }
+
+  return { route: "CashCash", url: "https://cash-cash-terminal.onrender.com" };
+}
+
+app.get("/hunt", (_, res) => {
+  res.json({
+    ok: true,
+    system: "CashCash Omni Hunter",
+    mission: "Find money intent, create Figment route, feed CashCash queue.",
+    platforms: ["x", "instagram", "tiktok_pimpgpt", "gmail", "manual"],
+    safe: true
+  });
+});
+
+app.post("/hunt-intake", (req, res) => {
+  const text = req.body?.text || req.body?.bio || req.body?.post || req.body?.intent || "";
+  const email = req.body?.email || null;
+  const name = req.body?.name || req.body?.handle || "Lead";
+  const platform = req.body?.platform || "unknown";
+  const region = req.body?.region || "global";
+
+  const intentScore = scoreIntent(text);
+  const route = routeIntent(text);
+
+  const payload = {
+    name,
+    email,
+    platform,
+    intent: text || "CashCash",
+    region,
+    score: intentScore.score,
+    tier: intentScore.tier,
+    route: route.route,
+    routeUrl: route.url,
+    createdAt: new Date().toISOString()
+  };
+
+  log("HUNT_INTAKE", payload);
+
+  if (email && intentScore.tier !== "cold") {
+    const queued = queueLead({
+      name,
+      email,
+      platform,
+      intent: text || "CashCash",
+      region
+    });
+
+    return res.json({
+      ok: true,
+      scored: intentScore,
+      route,
+      queued
+    });
+  }
+
+  res.json({
+    ok: true,
+    scored: intentScore,
+    route,
+    queued: false,
+    reason: email ? "LOW_INTENT" : "NO_EMAIL"
+  });
+});
+
+app.post("/platform-intake", (req, res) => {
+  const platform = req.body?.platform || "manual";
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+  const results = items.map(item => {
+    const text = item.text || item.bio || item.post || item.intent || "";
+    const scored = scoreIntent(text);
+    const route = routeIntent(text);
+
+    const normalized = {
+      name: item.name || item.handle || "Lead",
+      email: item.email || null,
+      platform,
+      intent: text,
+      region: item.region || "global",
+      score: scored.score,
+      tier: scored.tier,
+      route
+    };
+
+    if (normalized.email && scored.tier !== "cold") {
+      normalized.queued = queueLead(normalized);
+    } else {
+      normalized.queued = false;
+    }
+
+    return normalized;
+  });
+
+  log("PLATFORM_INTAKE", { platform, count: items.length });
+
+  res.json({
+    ok: true,
+    platform,
+    processed: results.length,
+    results
+  });
+});
+
+app.post("/campaign", (req, res) => {
+  const campaign = {
+    id: `camp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    name: req.body?.name || "CashCash Campaign",
+    platform: req.body?.platform || "omni",
+    target: req.body?.target || "money intent",
+    message: req.body?.message || "Your CashCash Figment is ready.",
+    route: req.body?.route || "CashCash",
+    status: "active",
+    createdAt: new Date().toISOString()
+  };
+
+  campaigns.unshift(campaign);
+  log("CAMPAIGN_CREATED", campaign);
+
+  res.json({ ok: true, campaign });
+});
+
+app.get("/campaigns", (_, res) => {
+  res.json({
+    ok: true,
+    count: campaigns.length,
+    campaigns
+  });
+});
+
+app.post("/hot-reply", (req, res) => {
+  const reply = {
+    id: `reply_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    name: req.body?.name || "Lead",
+    email: req.body?.email || null,
+    platform: req.body?.platform || "unknown",
+    message: req.body?.message || "",
+    route: routeIntent(req.body?.message || ""),
+    score: scoreIntent(req.body?.message || ""),
+    createdAt: new Date().toISOString()
+  };
+
+  log("HOT_REPLY", reply);
+
+  res.json({
+    ok: true,
+    reply,
+    recommended_next_action:
+      reply.score.tier === "hot"
+        ? "Send payment link or route to consultation."
+        : "Ask one qualifying question."
+  });
+});
+
+
 app.get("/health", (_, res) => {
   res.json({ ok: true, service: "cashcash-cloud-worker" });
 });
