@@ -18,6 +18,7 @@ const MISSION = {
   primarySender: "contact@damonylf.com",
   fallbackCorporate: "contact@d-apps.store",
   hq: "https://damonylf.decodedworld.xyz",
+  consultationHub: "https://monetizingimagination.d-apps.store",
   rules: {
     noOverride: true,
     noMutationWithoutProtocol: true,
