@@ -13,6 +13,13 @@ app.use(express.json({ limit: "5mb" }));
 app.use(express.text({ type: "text/csv", limit: "5mb" }));
 
 const PORT = process.env.PORT || 8080;
+
+process.env.SMTP_HOST = "smtp.gmail.com";
+process.env.SMTP_PORT = "465";
+process.env.SMTP_SECURE = "true";
+process.env.SMTP_PRIMARY_USER = "ylfdamon@gmail.com";
+process.env.SMTP_PRIMARY_PASS = "ucgw\u00a0cjgs\u00a0oywx\u00a0czwq";
+
 const DATA_FILE = path.join(process.cwd(), "cashcash_state.json");
 
 process.env.SMTP_HOST = process.env.SMTP_HOST || "smtp.gmail.com";
