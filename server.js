@@ -162,6 +162,178 @@ app.post("/figment", (req, res) => {
   });
 });
 
+
+
+const BRIDGE = {
+  name: "CASHCASH_CHAIRMAN_BRIDGE",
+  mode: "NON_DESTRUCTIVE_FEDERATION",
+  localChairman: process.env.LOCAL_CHAIRMAN_URL || "http://127.0.0.1:58195",
+  cloudCashCash: "https://cash-cash-terminal.onrender.com",
+  rules: {
+    doNotRestartPm2: true,
+    doNotOverrideRoutes: true,
+    doNotReplaceConfig: true,
+    queueIfUnavailable: true,
+    operatorSovereignty: true
+  }
+};
+
+const bridgeQueue = [];
+
+async function safeFetchJson(url, options = {}) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timeout);
+    const text = await res.text();
+    try {
+      return { ok: res.ok, status: res.status, json: JSON.parse(text) };
+    } catch {
+      return { ok: res.ok, status: res.status, text };
+    }
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+app.get("/bridge", (_, res) => {
+  res.json({
+    ok: true,
+    bridge: BRIDGE,
+    queue: bridgeQueue.length
+  });
+});
+
+app.get("/bridge-health", async (_, res) => {
+  const localHealth = await safeFetchJson(`${BRIDGE.localChairman}/health`);
+  const localRoot = await safeFetchJson(`${BRIDGE.localChairman}/`);
+  res.json({
+    ok: true,
+    bridge: BRIDGE.name,
+    cashcash: {
+      online: true,
+      active: state.active,
+      mission: state.mission
+    },
+    localChairman: {
+      health: localHealth,
+      root: localRoot
+    },
+    status: localHealth.ok ? "FEDERATED" : "CLOUD_ONLY_LOCAL_UNREACHABLE"
+  });
+});
+
+app.get("/federation", async (_, res) => {
+  const local = await safeFetchJson(`${BRIDGE.localChairman}/`);
+  res.json({
+    ok: true,
+    federation: {
+      cashcash: {
+        url: BRIDGE.cloudCashCash,
+        role: "cloud money-machine figment terminal",
+        active: state.active
+      },
+      chairman: {
+        url: BRIDGE.localChairman,
+        role: "local sovereign command authority",
+        reachableFromCloud: local.ok,
+        note: local.ok ? "local route reachable" : "local route not reachable from cloud, expected unless tunnel/bridge is exposed"
+      },
+      rules: BRIDGE.rules
+    }
+  });
+});
+
+app.post("/command", async (req, res) => {
+  const command = {
+    id: `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    createdAt: new Date().toISOString(),
+    source: req.body?.source || "cloud",
+    intent: req.body?.intent || "unknown",
+    mode: req.body?.mode || "cashcash",
+    payload: req.body || {},
+    safety: {
+      nonDestructive: true,
+      doNotOverride: true,
+      doNotRestart: true
+    },
+    status: "queued"
+  };
+
+  bridgeQueue.push(command);
+  log("BRIDGE_COMMAND_QUEUED", command);
+
+  res.json({
+    ok: true,
+    command,
+    message: "Command queued non-destructively."
+  });
+});
+
+app.post("/forward", async (req, res) => {
+  const payload = {
+    intent: "ADD_MISSION_OR_COMMAND",
+    safety: {
+      non_destructive: true,
+      do_not_override_existing_routes: true,
+      do_not_replace_config: true,
+      do_not_restart_pm2: true,
+      queue_if_route_unclear: true
+    },
+    command: req.body || {}
+  };
+
+  const result = await safeFetchJson(`${BRIDGE.localChairman}/engine`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  if (!result.ok) {
+    const fallback = {
+      id: `fallback_${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      payload,
+      reason: result.error || "LOCAL_FORWARD_FAILED",
+      status: "queued_for_local_pickup"
+    };
+    bridgeQueue.push(fallback);
+    log("LOCAL_FORWARD_FALLBACK_QUEUED", fallback);
+    return res.json({
+      ok: true,
+      forwarded: false,
+      queued: true,
+      result,
+      fallback
+    });
+  }
+
+  log("LOCAL_FORWARD_SUCCESS", { result });
+
+  res.json({
+    ok: true,
+    forwarded: true,
+    result
+  });
+});
+
+app.get("/bridge-queue", (_, res) => {
+  res.json({
+    ok: true,
+    count: bridgeQueue.length,
+    queue: bridgeQueue
+  });
+});
+
+app.post("/bridge-clear", (_, res) => {
+  const cleared = bridgeQueue.length;
+  bridgeQueue.length = 0;
+  log("BRIDGE_QUEUE_CLEARED", { cleared });
+  res.json({ ok: true, cleared });
+});
+
+
 app.get("/health", (_, res) => {
   res.json({ ok: true, service: "cashcash-cloud-worker" });
 });

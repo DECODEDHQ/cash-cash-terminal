@@ -1,0 +1,22 @@
+{
+  "bridge": "CASHCASH_CHAIRMAN_BRIDGE",
+  "mode": "NON_DESTRUCTIVE_FEDERATION",
+  "principle": "connect, do not override",
+  "local": {
+    "chairman": "http://127.0.0.1:58195",
+    "openclaw": "http://127.0.0.1:58195",
+    "health": "http://127.0.0.1:58195/health",
+    "engine": "http://127.0.0.1:58195/engine"
+  },
+  "cloud": {
+    "cashcash": "https://cash-cash-terminal.onrender.com"
+  },
+  "rules": {
+    "do_not_restart_pm2": true,
+    "do_not_override_routes": true,
+    "do_not_replace_config": true,
+    "do_not_mutate_without_protocol": true,
+    "queue_if_route_unavailable": true,
+    "operator_sovereignty": true
+  }
+}
