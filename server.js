@@ -34,6 +34,45 @@ function log(event, data = {}) {
   state.logs = state.logs.slice(0, 200);
 }
 
+
+
+function queueLead(raw = {}) {
+  const email = raw.email || raw.to || null;
+
+  const lead = {
+    id: `lead_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    name: raw.name || "Lead",
+    email,
+    platform: raw.platform || "manual",
+    intent: raw.intent || "CashCash",
+    region: raw.region || "global",
+    status: "queued",
+    createdAt: new Date().toISOString()
+  };
+
+  if (!email) {
+    log("LEAD_SKIPPED_NO_EMAIL", lead);
+    return { ok: false, reason: "NO_EMAIL", lead };
+  }
+
+  if (state.suppressed.includes(email)) {
+    log("LEAD_SUPPRESSED", { email });
+    return { ok: false, reason: "SUPPRESSED", lead };
+  }
+
+  if (state.queue.some(x => x.email === email) || state.sent.some(x => x.to === email)) {
+    log("LEAD_DUPLICATE", { email });
+    return { ok: false, reason: "DUPLICATE", lead };
+  }
+
+  state.queue.push(lead);
+  state.counters.totalQueued++;
+  log("LEAD_QUEUED", lead);
+
+  return { ok: true, lead };
+}
+
+
 function cashcashMessage(lead) {
   return `Hi ${lead.name || "there"},
 
