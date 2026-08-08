@@ -2,6 +2,8 @@ import express from "express";
 import { Resend } from "resend";
 import cron from "node-cron";
 import fs from "fs";
+import os from "os";
+import path from "path";
 import { parse } from "csv-parse/sync";
 
 const app = express();
@@ -98,7 +100,7 @@ async function sendLead(lead) {
   if (!lead.email) throw new Error("NO_EMAIL");
 
   const r = await resend.emails.send({
-    from: "CashCash <onboarding@resend.dev>",
+    from: process.env.CASHCASH_FROM || "CashCash <onboarding@resend.dev>",
     to: [lead.email],
     subject: "Your CashCash Figment is ready",
     text: cashcashMessage(lead)
@@ -146,31 +148,54 @@ cron.schedule("*/1 * * * *", async () => {
 });
 
 
-import spiderRegistry from "./spider_registry.json" assert { type: "json" };
+import spiderRegistry from "./spider_registry.json" with { type: 'json' };
+
+const ENGINE_REGISTRY_PATH = process.env.CHAIRMAN_ENGINE_REGISTRY ||
+  path.join(os.homedir(), "chairman_engine_bus", "registry", "engines.json");
+
+function engineRegistry() {
+  try {
+    return JSON.parse(fs.readFileSync(ENGINE_REGISTRY_PATH, "utf8"));
+  } catch {
+    return {
+      dreammaker: {url: process.env.DREAMMAKER_URL || spiderRegistry.routes.dreammaker.url},
+      chairman: {url: process.env.LOCAL_CHAIRMAN_URL || spiderRegistry.routes.local_chairman.url}
+    };
+  }
+}
+
+function resolvedSpiderRegistry() {
+  const resolved = structuredClone(spiderRegistry);
+  const engines = engineRegistry();
+  resolved.routes.dreammaker.url = engines.dreammaker.url;
+  resolved.routes.local_chairman.url = engines.chairman.url;
+  return resolved;
+}
 
 app.get("/spider", (_, res) => {
-  res.json(spiderRegistry);
+  res.json(resolvedSpiderRegistry());
 });
 
 app.get("/routes", (_, res) => {
-  res.json(spiderRegistry.routes);
+  res.json(resolvedSpiderRegistry().routes);
 });
 
 app.post("/route", (req, res) => {
   const intent = String(req.body?.intent || "").toLowerCase();
+  const registry = resolvedSpiderRegistry();
 
-  let route = spiderRegistry.routes.corporate_hq;
+  let route = registry.routes.corporate_hq;
 
   if (intent.includes("money") || intent.includes("cash") || intent.includes("income")) {
-    route = { label: "CashCash", role: "money-machine-figment-terminal", url: spiderRegistry.cashcash.url };
+    route = { label: "CashCash", role: "money-machine-figment-terminal", url: registry.cashcash.url };
   } else if (intent.includes("custom") || intent.includes("build") || intent.includes("manifest")) {
-    route = spiderRegistry.routes.dreammaker;
+    route = registry.routes.dreammaker;
   } else if (intent.includes("done") || intent.includes("marketing") || intent.includes("agency")) {
-    route = spiderRegistry.routes.earn_agency;
+    route = registry.routes.earn_agency;
   } else if (intent.includes("consult")) {
-    route = spiderRegistry.routes.consultation;
+    route = registry.routes.consultation;
   } else if (intent.includes("license") || intent.includes("enterprise") || intent.includes("investor")) {
-    route = spiderRegistry.routes.corporate_hq;
+    route = registry.routes.corporate_hq;
   }
 
   res.json({
@@ -206,7 +231,7 @@ app.post("/figment", (req, res) => {
 const BRIDGE = {
   name: "CASHCASH_CHAIRMAN_BRIDGE",
   mode: "NON_DESTRUCTIVE_FEDERATION",
-  localChairman: process.env.LOCAL_CHAIRMAN_URL || "http://127.0.0.1:58195",
+  localChairman: process.env.LOCAL_CHAIRMAN_URL || engineRegistry().chairman.url,
   cloudCashCash: "https://cash-cash-terminal.onrender.com",
   rules: {
     doNotRestartPm2: true,
@@ -888,24 +913,35 @@ app.post("/lead", (req, res) => {
   });
 });
 
+
 app.post("/send", async (req, res) => {
   try {
-    const result = await sendLead({
-      id: `direct_${Date.now()}`,
-      name: req.body.name || "Lead",
-      email: req.body.to
-    });
+    let lead = req.body?.email ? req.body : null;
+    if (!lead && req.body?.to) {
+      lead = {
+        id: `direct_${Date.now()}`,
+        name: req.body.name || "Lead",
+        email: req.body.to
+      };
+    }
 
-    res.json({
-      ok: true,
-      sent: true,
-      ...result
+    if (!lead) {
+      if (!state.queue.length) {
+        return res.status(400).json({ ok:false, error:"NO_EMAIL" });
+      }
+      lead = state.queue.shift();
+    }
+
+    const sent = await sendLead(lead);
+    return res.json({ ok:true, sent });
+
+  } catch (err) {
+    state.failed.unshift({
+      time: new Date().toISOString(),
+      error: err.message
     });
-  } catch (e) {
-    res.json({
-      ok: false,
-      error: e.message
-    });
+    state.counters.totalFailed++;
+    return res.status(500).json({ ok:false, error: err.message });
   }
 });
 
