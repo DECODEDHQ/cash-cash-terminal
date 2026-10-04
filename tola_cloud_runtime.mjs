@@ -55,6 +55,22 @@ const shortHash = value => sha256(value).slice(0, 32);
 const hasScope = (value, expected) => Array.isArray(value) && value.map(String).includes(expected);
 const bearer = request => String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
 
+function isMountedPath(target, mountInfo) {
+  const resolved = path.resolve(target);
+  let data = mountInfo;
+  if (data === undefined) {
+    try { data = fs.readFileSync("/proc/self/mountinfo", "utf8"); }
+    catch { return false; }
+  }
+  return String(data).split(/\r?\n/).some(line => {
+    const fields = line.split(" - ")[0]?.split(" ") || [];
+    const encoded = fields[4];
+    if (!encoded) return false;
+    const mounted = path.resolve(encoded.replace(/\\([0-7]{3})/g, (_match, octal) => String.fromCharCode(Number.parseInt(octal, 8))));
+    return mounted !== path.parse(mounted).root && (resolved === mounted || resolved.startsWith(`${mounted}${path.sep}`));
+  });
+}
+
 function safeError(error) {
   return String(error?.message || error || "UNKNOWN")
     .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]{12,})\b/gi, "[REDACTED]")
@@ -342,7 +358,7 @@ class TolaCloudRuntime {
         ok: true,
         service: "TOLA",
         enabled: this.enabled,
-        state_dir_persistent: this.stateDir.startsWith("/var/data/"),
+        state_dir_persistent: isMountedPath(this.stateDir),
         status: this.enabled ? cloud.state : "STAGED_DISABLED",
         last_poll_at: this.lastPollAt,
       });
@@ -870,4 +886,4 @@ export function createTolaCloudRuntime(options) {
   return runtime;
 }
 
-export { CloudStore, IDENTITIES, TolaCloudRuntime, sha256 };
+export { CloudStore, IDENTITIES, TolaCloudRuntime, isMountedPath, sha256 };

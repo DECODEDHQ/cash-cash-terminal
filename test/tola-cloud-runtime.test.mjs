@@ -3,11 +3,22 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { TolaCloudRuntime, sha256 } from "../tola_cloud_runtime.mjs";
+import { TolaCloudRuntime, isMountedPath, sha256 } from "../tola_cloud_runtime.mjs";
 
 function jsonResponse(status, body) {
   return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
+
+test("persistence status requires a real non-root mount", () => {
+  const mountInfo = [
+    "29 23 0:25 / / rw,relatime - overlay overlay rw",
+    "41 29 8:1 / /var/data/chairman rw,relatime - ext4 /dev/sda1 rw",
+  ].join("\n");
+  assert.equal(isMountedPath("/var/data/chairman", mountInfo), true);
+  assert.equal(isMountedPath("/tmp/chairman-cloud-state", mountInfo), false);
+  assert.equal(isMountedPath("/var/data/chairman/jobs", mountInfo), true);
+  assert.equal(isMountedPath("/unmounted/path", "29 23 0:25 / / rw,relatime - overlay overlay rw"), false);
+});
 
 test("private inbound replay produces one reasoning call and one reply", async t => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-test-"));
