@@ -70,6 +70,44 @@ test("private inbound replay produces one reasoning call and one reply", async t
   assert.equal(receipt.result.duplicate_execution, false);
 });
 
+test("a migrated local receipt suppresses a pre-cloud provider replay", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-migrated-replay-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  let externalCalls = 0;
+  const runtime = new TolaCloudRuntime({
+    app: {},
+    fetchImpl: async () => {
+      externalCalls += 1;
+      throw new Error("migrated replay must not call a provider or model");
+    },
+    env: {
+      TOLA_STATE_DIR: stateDir,
+      TOLA_WHATSAPP_API_KEY: "test-provider-token",
+      OPENAI_API_KEY: "test-openai-token",
+    },
+  });
+  const message = { id: "wamid.pre-cloud-completed", from: "user:15550001111", type: "text", text: { body: "Previously completed WANT" } };
+  const reference = runtime.reference("123456", message, null);
+  const historical = runtime.store.createJob({
+    worker_type: "HISTORICAL_TOLA_RECEIPT_IMPORT",
+    owner: "TOLA_WHATSAPP",
+    intent: "Preserve completed pre-cloud TOLA transaction lineage",
+    success_condition: "Historical receipt is visible to cloud replay suppression",
+    idempotency_key: `historical:${reference.action_id}`,
+    constraints: { actionable: false, source_receipt: reference.action_id },
+    result: { imported: true, terminal_state: "EXECUTED" },
+    terminal_state: "EXECUTED",
+  }).job;
+  runtime.store.beginAction(historical.job_id, reference.action_id);
+  runtime.store.finishAction(historical.job_id, reference.action_id, { imported: true }, []);
+  const replay = await runtime.handleMessage("123456", message, []);
+  assert.equal(replay.duplicate, true);
+  assert.equal(replay.duplicate_execution, false);
+  assert.equal(replay.duplicate_reply, false);
+  assert.equal(replay.job_id, historical.job_id);
+  assert.equal(externalCalls, 0);
+});
+
 test("firewall rejects stale Canon and consequential action without authority", async t => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-firewall-"));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));

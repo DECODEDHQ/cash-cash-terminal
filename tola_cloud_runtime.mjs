@@ -697,11 +697,23 @@ class TolaCloudRuntime {
     const contact = contacts.find(item => item?.wa_id === message?.from) || null;
     const reference = this.reference(agentId, message, contact?.profile?.name || null);
     const existing = this.store.getByIdempotency(reference.action_id);
-    if (existing) {
-      const checkpoint = { ...(existing.checkpoint || {}), duplicate_count: Number(existing.checkpoint?.duplicate_count || 0) + 1, last_replay_at: now() };
-      this.store.updateJob(existing.job_id, { checkpoint });
-      this.store.event(existing.job_id, "TOLA_WHATSAPP_REPLAY_SUPPRESSED", { inbound_message_id: reference.message_id, duplicate_execution: false, duplicate_reply: false, at: now() });
-      return { duplicate: true, job_id: existing.job_id, a2a_id: existing.result?.A2A_ID || existing.result?.outbound?.A2A_ID || null, duplicate_execution: false, duplicate_reply: false };
+    const existingReceipt = this.store.receipt(reference.action_id);
+    if (existing || existingReceipt) {
+      const existingJob = existing || this.store.get(existingReceipt.job_id);
+      if (!existingJob) {
+        return {
+          duplicate: true,
+          job_id: existingReceipt.job_id,
+          a2a_id: null,
+          duplicate_execution: false,
+          duplicate_reply: false,
+          historical_receipt_only: true,
+        };
+      }
+      const checkpoint = { ...(existingJob.checkpoint || {}), duplicate_count: Number(existingJob.checkpoint?.duplicate_count || 0) + 1, last_replay_at: now() };
+      this.store.updateJob(existingJob.job_id, { checkpoint });
+      this.store.event(existingJob.job_id, "TOLA_WHATSAPP_REPLAY_SUPPRESSED", { inbound_message_id: reference.message_id, duplicate_execution: false, duplicate_reply: false, at: now() });
+      return { duplicate: true, job_id: existingJob.job_id, a2a_id: existingJob.result?.A2A_ID || existingJob.result?.outbound?.A2A_ID || null, duplicate_execution: false, duplicate_reply: false };
     }
     const intent = this.intentFor(message);
     if (!intent) return { ignored: true, reason: "EMPTY_MESSAGE" };
