@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 
 const PROVIDER_BASE = "https://api.whatsapp.com/agent/v1";
 const OPENAI_URL = "https://api.openai.com/v1/responses";
+const META_MODEL_BASE = "https://api.meta.ai/v1";
 const execFileAsync = promisify(execFile);
 const IDENTITIES = new Set([
   "TOLA_WHATSAPP",
@@ -41,12 +42,12 @@ const MEDIA_LIMITS = Object.freeze({
   document: 32 * 1024 * 1024,
 });
 const WHATSAPP_OUTBOUND_MEDIA_LIMIT = 16 * 1024 * 1024;
-const PRIVATE_MEDIA_CAPABILITY_VERSION = "private-media-v3-meta-muse-video";
+const PRIVATE_MEDIA_CAPABILITY_VERSION = "private-media-v4-live-muse-registry";
 const PRIVATE_MEDIA_SCOPE = "PRIVATE_ARTIFACT_CREATE";
 const DEFAULT_VIDEO_PRODUCT = "Meta Muse Video";
 const DEFAULT_REPLY = "Tell me what you want. I’ll work out the rest.";
 const CAPABILITY_REPLY = "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.";
-const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V5_META_MUSE_VIDEO";
+const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V6_LIVE_MUSE_REGISTRY";
 const TOLA_BEHAVIOR_CONTRACT = [
   `TOLA BEHAVIOR CONTRACT ${TOLA_BEHAVIOR_CONTRACT_REVISION}. This contract applies to every WhatsApp response and takes priority over generic assistant behavior.`,
   "TOLA is a human-facing execution agent, not a generic chatbot. Speak as TOLA and return only the direct WhatsApp reply.",
@@ -181,7 +182,15 @@ function validGeneratedImage(bytes) {
   const head = bytes.subarray(0, 16);
   return head.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))
     || head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
-    || head.subarray(0, 4).toString("ascii") === "RIFF";
+    || (head.subarray(0, 4).toString("ascii") === "RIFF" && head.subarray(8, 12).toString("ascii") === "WEBP");
+}
+
+function generatedImageMime(bytes) {
+  if (!Buffer.isBuffer(bytes)) return null;
+  if (bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "image/jpeg";
+  if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  return null;
 }
 
 function capabilityFailureReply(error) {
@@ -417,6 +426,10 @@ class TolaCloudRuntime {
     this.enabled = /^(?:1|true|yes|on)$/i.test(String(env.TOLA_CLOUD_ENABLED || ""));
     this.token = env.TOLA_WHATSAPP_API_KEY || "";
     this.apiKey = env.OPENAI_API_KEY || "";
+    this.metaModelKey = env.MODEL_API_KEY || "";
+    this.museSparkModel = env.META_MUSE_SPARK_MODEL || "muse-spark-1.3";
+    this.museImageModel = env.META_MUSE_IMAGE_MODEL || "muse-image-1.0";
+    this.museVoiceModel = env.META_MUSE_VOICE_MODEL || "muse-voice-transcribe-1.0";
     this.adminToken = env.TOLA_CLOUD_ADMIN_TOKEN || "";
     this.localNodeToken = env.TOLA_LOCAL_NODE_TOKEN || "";
     this.model = env.OPENAI_COMMAND_TOWER_MODEL || "gpt-5.4-mini";
@@ -432,6 +445,36 @@ class TolaCloudRuntime {
     this.lastPollAt = null;
     this.lastError = null;
     this.transientMedia = new Map();
+  }
+
+  museCapabilities() {
+    const authenticated = Boolean(this.metaModelKey);
+    return {
+      authenticated,
+      state: authenticated ? "AVAILABLE" : "AUTHENTICATION_REQUIRED",
+      reasoning: authenticated,
+      web_search: authenticated,
+      image_perception: authenticated,
+      document_perception: true,
+      video_perception: false,
+      image_generation: authenticated,
+      image_editing: authenticated,
+      audio_transcription: authenticated,
+      video_generation: this.publicVideoAvailability(),
+    };
+  }
+
+  liveCapabilityTruth() {
+    return {
+      cloud_reasoning: true,
+      web_research: true,
+      whatsapp_private_reply: true,
+      inbound_media_hydration: true,
+      private_image_creation: true,
+      meta_muse: this.museCapabilities(),
+      chairman_local: this.store.availability("CHAIRMAN_LOCAL").state,
+      consequential_actions: "EXACT_AUTHORITY_AND_PAI_REQUIRED",
+    };
   }
 
   videoAvailability() {
@@ -478,6 +521,10 @@ class TolaCloudRuntime {
         last_poll_at: this.lastPollAt,
         tola_contract_revision: TOLA_BEHAVIOR_CONTRACT_REVISION,
         private_media_execution: true,
+        muse_runtime: {
+          available: this.museCapabilities().authenticated,
+          state: this.museCapabilities().state,
+        },
         genuine_video_generation: this.publicVideoAvailability(),
         quoted_reply_context: false,
       });
@@ -734,8 +781,8 @@ class TolaCloudRuntime {
     let processingPath = "UNAVAILABLE_MEDIA_FORMAT";
     if (message.type === "image" && IMAGE_MIME_TYPES.has(mimeType)) processingPath = "OPENAI_INPUT_IMAGE";
     else if (message.type === "document" && DOCUMENT_MIME_TYPES.has(mimeType)) processingPath = "OPENAI_INPUT_FILE";
-    else if (message.type === "video") processingPath = "VIDEO_CONTENT_PROCESSING_UNAVAILABLE";
-    else if (message.type === "audio") processingPath = "AUDIO_CONTENT_PROCESSING_UNAVAILABLE";
+    else if (message.type === "video") processingPath = this.metaModelKey ? "META_MUSE_MULTIMODAL_VIDEO_PENDING" : "VIDEO_CONTENT_PROCESSING_UNAVAILABLE";
+    else if (message.type === "audio") processingPath = this.metaModelKey ? "META_MUSE_VOICE_TRANSCRIPTION_PENDING" : "AUDIO_CONTENT_PROCESSING_UNAVAILABLE";
     else if (message.type === "document") processingPath = "DOCUMENT_MIME_PROCESSING_UNAVAILABLE";
     return { type: message.type, mime_type: mimeType, size_bytes: bytes.length, sha256: actual, media_identity_hash: shortHash(`${message.type}:${source.id}:${actual}`), filename: String(source.filename || "attachment").slice(0, 120), processing_path: processingPath, bytes };
   }
@@ -868,12 +915,136 @@ class TolaCloudRuntime {
     const call = body?.output?.find(item => item?.type === "image_generation_call" && typeof item.result === "string");
     const bytes = call?.result ? Buffer.from(call.result, "base64") : null;
     if (!body?.id || !validGeneratedImage(bytes)) throw new Error("OPENAI_IMAGE_RESULT_INVALID");
+    const mimeType = generatedImageMime(bytes);
     return {
       bytes,
-      mime_type: "image/jpeg",
-      filename: "tola-created-image.jpg",
+      mime_type: mimeType,
+      filename: mimeType === "image/png" ? "tola-created-image.png" : mimeType === "image/webp" ? "tola-created-image.webp" : "tola-created-image.jpg",
       openai_response_id: body.id,
+      generation_id: body.id,
+      provider: "openai",
+      model: this.imageModel,
       revised_prompt_sha256: call.revised_prompt ? sha256(call.revised_prompt) : null,
+      request_sha256: sha256(request),
+    };
+  }
+
+  async generateMuseImage(plan, envelope) {
+    if (!this.metaModelKey) throw new Error("TOLA_META_MODEL_API_AUTHENTICATION_REQUIRED");
+    const prompt = [
+      "Create the actual private visual asset requested below. Return the image, not a plan or explanation.",
+      "Preserve supplied reference content unless the WANT explicitly changes it.",
+      plan.prompt,
+    ].join("\n\n").slice(0, 12000);
+    let response;
+    let requestEvidence;
+    if (plan.source_image) {
+      const form = new FormData();
+      form.set("model", this.museImageModel);
+      form.set("prompt", prompt);
+      form.set("response_format", "b64_json");
+      form.set("image", new Blob([plan.source_image.bytes], { type: plan.source_image.mime_type }), plan.source_image.filename || "reference-image");
+      requestEvidence = { model: this.museImageModel, prompt, source_media_sha256: plan.source_image.sha256, operation: "edit" };
+      response = await this.fetch(`${META_MODEL_BASE}/images/edits`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${this.metaModelKey}` },
+        body: form,
+        signal: AbortSignal.timeout(240000),
+      });
+    } else {
+      const request = { model: this.museImageModel, prompt, response_format: "b64_json" };
+      requestEvidence = { ...request, operation: "generate" };
+      response = await this.fetch(`${META_MODEL_BASE}/images/generations`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${this.metaModelKey}`, "content-type": "application/json" },
+        body: JSON.stringify(request),
+        signal: AbortSignal.timeout(240000),
+      });
+    }
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(`META_MUSE_IMAGE_${response.status}:${String(body?.error?.code || body?.error?.type || "UNKNOWN").slice(0, 80)}`);
+    const encoded = body?.data?.find(item => typeof item?.b64_json === "string")?.b64_json;
+    const bytes = encoded ? Buffer.from(encoded, "base64") : null;
+    if (!validGeneratedImage(bytes)) throw new Error("META_MUSE_IMAGE_RESULT_INVALID");
+    const generationId = String(body?.id || `muse-image-${shortHash(bytes)}`);
+    const mimeType = generatedImageMime(bytes);
+    return {
+      bytes,
+      mime_type: mimeType,
+      filename: mimeType === "image/png" ? "tola-created-image.png" : mimeType === "image/webp" ? "tola-created-image.webp" : "tola-created-image.jpg",
+      openai_response_id: null,
+      generation_id: generationId,
+      provider: "meta",
+      model: this.museImageModel,
+      source_media_sha256: plan.source_image?.sha256 || null,
+      request_sha256: sha256({ ...requestEvidence, A2A_ID: envelope.A2A_ID }),
+    };
+  }
+
+  async transcribeMuseAudio(media) {
+    if (!this.metaModelKey) return null;
+    const form = new FormData();
+    form.set("model", this.museVoiceModel);
+    form.set("file", new Blob([media.bytes], { type: media.mime_type }), media.filename || "whatsapp-audio");
+    const response = await this.fetch(`${META_MODEL_BASE}/asr/transcribe`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${this.metaModelKey}` },
+      body: form,
+      signal: AbortSignal.timeout(180000),
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(`META_MUSE_VOICE_${response.status}:${String(body?.error?.code || body?.error?.type || "UNKNOWN").slice(0, 80)}`);
+    const transcript = String(body?.text || body?.transcript || body?.output_text || "").trim();
+    if (!transcript) throw new Error("META_MUSE_VOICE_TRANSCRIPT_EMPTY");
+    return {
+      text: transcript.slice(0, 32000),
+      response_id: String(body?.id || `muse-voice-${shortHash(`${media.sha256}:${transcript}`)}`),
+      model: this.museVoiceModel,
+      transcript_sha256: sha256(transcript),
+    };
+  }
+
+  async resolveWithMuse(source, media, envelope) {
+    if (!this.metaModelKey || isOpening(source.intent) || isCapabilityQuestion(source.intent)) return null;
+    const history = this.relationshipHistory(source, 8).map(item => item.intent).filter(Boolean);
+    const inputText = JSON.stringify({
+      want: source.intent,
+      relationship_history: history,
+      media: media ? { type: media.type, mime_type: media.mime_type, sha256: media.sha256, processing_path: media.processing_path } : null,
+      canon_revision: envelope.CANON_REVISION,
+      authority: "REASONING_ONLY; do not claim external effects",
+    });
+    const input = media?.processing_path === "OPENAI_INPUT_IMAGE"
+      ? [{ role: "user", content: [
+          { type: "input_text", text: inputText },
+          { type: "input_image", image_url: `data:${media.mime_type};base64,${media.bytes.toString("base64")}` },
+        ] }]
+      : inputText;
+    const request = {
+      model: this.museSparkModel,
+      input,
+      tools: [{ type: "web_search" }],
+      metadata: {
+        a2a_id: envelope.A2A_ID,
+        opportunity_id: envelope.OPPORTUNITY_ID,
+        producer: "MUSE_REN",
+        canon_revision: sha256(envelope.CANON_REVISION),
+      },
+    };
+    const response = await this.fetch(`${META_MODEL_BASE}/responses`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${this.metaModelKey}`, "content-type": "application/json" },
+      body: JSON.stringify(request),
+      signal: AbortSignal.timeout(120000),
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(`META_MUSE_SPARK_${response.status}:${String(body?.error?.code || body?.error?.type || "UNKNOWN").slice(0, 80)}`);
+    const output = responseText(body);
+    if (!body?.id || !output) throw new Error("META_MUSE_SPARK_RESULT_INVALID");
+    return {
+      response_id: body.id,
+      model: this.museSparkModel,
+      output: output.slice(0, 16000),
       request_sha256: sha256(request),
     };
   }
@@ -1127,15 +1298,30 @@ class TolaCloudRuntime {
       };
       artifact = generation.artifact;
     } else {
-      generated = await this.generatePrivateImage(plan, envelope, previousResponseId);
+      if (this.metaModelKey) {
+        try { generated = await this.generateMuseImage(plan, envelope); }
+        catch (error) {
+          this.store.event(execution.job_id, "META_MUSE_IMAGE_ROUTE_FAILED", { error: safeError(error), fallback: "EXISTING_OPENAI_IMAGE_ROUTE", at: now() });
+          generated = await this.generatePrivateImage(plan, envelope, previousResponseId);
+        }
+      } else {
+        generated = await this.generatePrivateImage(plan, envelope, previousResponseId);
+      }
+      generation = {
+        generation_id: generated.generation_id,
+        provider: generated.provider,
+        model: generated.model,
+        request_sha256: generated.request_sha256,
+      };
       artifact = (() => {
           const artifactDir = path.join(this.stateDir, "deliverables", "tola");
           fs.mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
           const artifactId = shortHash(`${PRIVATE_MEDIA_CAPABILITY_VERSION}:${source.idempotency_key}`);
-          const file = path.join(artifactDir, `${artifactId}.jpg`);
+          const extension = generated.mime_type === "image/png" ? "png" : generated.mime_type === "image/webp" ? "webp" : "jpg";
+          const file = path.join(artifactDir, `${artifactId}.${extension}`);
           if (!fs.existsSync(file)) fs.writeFileSync(file, generated.bytes, { mode: 0o600, flag: "wx" });
           const bytes = fs.readFileSync(file);
-          return { bytes, artifact_ref: `deliverable:${artifactId}`, mime_type: "image/jpeg", filename: "tola-created-image.jpg", sha256: sha256(bytes), size_bytes: bytes.length };
+          return { bytes, artifact_ref: `deliverable:${artifactId}`, mime_type: generated.mime_type, filename: generated.filename, sha256: sha256(bytes), size_bytes: bytes.length };
         })();
     }
     const result = {
@@ -1240,19 +1426,30 @@ class TolaCloudRuntime {
     const envelope = job.constraints.a2a_envelope;
     this.validateEnvelope(envelope, source);
     const previousResponseId = this.priorResponse(envelope.TRANSACTION_ID, job.job_id);
+    let voice = null;
+    let muse = null;
+    if (media?.processing_path === "META_MUSE_VOICE_TRANSCRIPTION_PENDING") {
+      try {
+        voice = await this.transcribeMuseAudio(media);
+        media.processing_path = "META_MUSE_VOICE_TRANSCRIBED";
+      } catch (error) {
+        media.processing_path = "META_MUSE_VOICE_TRANSCRIPTION_FAILED";
+        this.store.event(job.job_id, "META_MUSE_VOICE_ROUTE_FAILED", { error: safeError(error), at: now() });
+      }
+    }
+    try { muse = await this.resolveWithMuse(source, media, envelope); }
+    catch (error) {
+      this.store.event(job.job_id, "META_MUSE_SPARK_ROUTE_FAILED", { error: safeError(error), fallback: "OPENAI_COMMAND_TOWER_RUNTIME", at: now() });
+    }
     const inputEnvelope = {
       A2A_ID: envelope.A2A_ID, OPPORTUNITY_ID: envelope.OPPORTUNITY_ID, WANT_ID: envelope.WANT_ID,
       TRANSACTION_ID: envelope.TRANSACTION_ID, RELATIONSHIP_ID: envelope.RELATIONSHIP_ID,
       producer_identity: envelope.producer_identity, action_class: envelope.action_class,
       payload: source.intent,
-      capability_truth: {
-        cloud_reasoning: true, whatsapp_private_reply: true,
-        private_image_creation: true,
-        private_video_creation: this.publicVideoAvailability(),
-        chairman_local: this.store.availability("CHAIRMAN_LOCAL").state,
-        consequential_actions: "EXACT_AUTHORITY_AND_PAI_REQUIRED",
-      },
+      capability_truth: this.liveCapabilityTruth(),
       media_processing: media ? { type: media.type, mime_type: media.mime_type, size_bytes: media.size_bytes, sha256: media.sha256, processing_path: media.processing_path } : null,
+      muse_reasoning: muse ? { response_id: muse.response_id, model: muse.model, output: muse.output } : null,
+      audio_transcript: voice?.text || null,
     };
     const inputText = JSON.stringify(inputEnvelope);
     let input = inputText;
@@ -1295,6 +1492,7 @@ class TolaCloudRuntime {
         provider_message_id: envelope.provider_message_id, producer_identity: envelope.producer_identity,
         recipient_identity: envelope.recipient_identity, CANON_REVISION: envelope.CANON_REVISION,
         reasoning_result_ref: `openai:response:${body.id}`, openai_response_id: body.id,
+        muse_response_id: muse?.response_id || null,
         previous_response_id: previousResponseId, reasoning_output: output,
         next_action: "TOLA_REPLY_TO_ORIGINAL_WHATSAPP_THREAD",
         receipt: { idempotency_key: envelope.idempotency_key, status: "COMPLETED", execution_count: 1, completed_at: now() },
@@ -1308,6 +1506,12 @@ class TolaCloudRuntime {
         previous_response_id: previousResponseId,
         model: this.model,
         media_supplied: ["OPENAI_INPUT_IMAGE", "OPENAI_INPUT_FILE"].includes(media?.processing_path),
+        muse_response_id: muse?.response_id || null,
+        muse_model: muse?.model || null,
+        muse_request_sha256: muse?.request_sha256 || null,
+        muse_voice_response_id: voice?.response_id || null,
+        muse_voice_model: voice?.model || null,
+        transcript_sha256: voice?.transcript_sha256 || null,
         tola_contract_revision: TOLA_BEHAVIOR_CONTRACT_REVISION,
         tola_contract_sha256: sha256(TOLA_BEHAVIOR_CONTRACT),
         capability_question: isCapabilityQuestion(source.intent),
@@ -1515,7 +1719,7 @@ class TolaCloudRuntime {
     } else {
       sent = await this.sendReply(reference, reply);
     }
-    const sendResult = { status: "WHATSAPP_REPLY_ACCEPTED", inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id, channel_thread_id: reference.thread_id, A2A_ID: a2aId, OPPORTUNITY_ID: opportunityId, WANT_ID: wantId, job_id: source.job_id, reasoning_job_id: reasoning.job_id, openai_response_id: outcome.result.openai_response_id, reasoning_result_ref: outcome.result.reasoning_result_ref, receipt_id: sendKey, delivery_state: "accepted", duplicate_execution: false, duplicate_reply: false, chairman_availability: this.store.availability("CHAIRMAN_LOCAL").state, ...(privateMedia ? { capability_execution_job_id: privateMedia.execution_job_id, capability_receipt_id: privateMedia.execution_receipt_id, media_delivery: { type: privateMedia.plan.type, mime_type: privateMedia.artifact.mime_type, size_bytes: privateMedia.artifact.size_bytes, sha256: privateMedia.artifact.sha256, artifact_ref: privateMedia.artifact.artifact_ref, generation_id: outcome.result.generation_id || null, generation_provider: outcome.result.generation_provider || null, generation_model: outcome.result.generation_model || null, duration_seconds: privateMedia.artifact.duration_seconds || null, resolution: privateMedia.artifact.resolution || null, codec: privateMedia.artifact.codec || null, frame_difference: privateMedia.artifact.frame_difference || null, provider_generated_frames: privateMedia.artifact.provider_generated_frames || false, local_motion_synthesis: privateMedia.artifact.local_motion_synthesis || false, provider_media_id_persisted: false } } : {}) };
+    const sendResult = { status: "WHATSAPP_REPLY_ACCEPTED", inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id, channel_thread_id: reference.thread_id, A2A_ID: a2aId, OPPORTUNITY_ID: opportunityId, WANT_ID: wantId, job_id: source.job_id, reasoning_job_id: reasoning.job_id, openai_response_id: outcome.result.openai_response_id, muse_response_id: outcome.result.muse_response_id || null, reasoning_result_ref: outcome.result.reasoning_result_ref, receipt_id: sendKey, delivery_state: "accepted", duplicate_execution: false, duplicate_reply: false, chairman_availability: this.store.availability("CHAIRMAN_LOCAL").state, ...(privateMedia ? { capability_execution_job_id: privateMedia.execution_job_id, capability_receipt_id: privateMedia.execution_receipt_id, media_delivery: { type: privateMedia.plan.type, mime_type: privateMedia.artifact.mime_type, size_bytes: privateMedia.artifact.size_bytes, sha256: privateMedia.artifact.sha256, artifact_ref: privateMedia.artifact.artifact_ref, generation_id: outcome.result.generation_id || null, generation_provider: outcome.result.generation_provider || null, generation_model: outcome.result.generation_model || null, duration_seconds: privateMedia.artifact.duration_seconds || null, resolution: privateMedia.artifact.resolution || null, codec: privateMedia.artifact.codec || null, frame_difference: privateMedia.artifact.frame_difference || null, provider_generated_frames: privateMedia.artifact.provider_generated_frames || false, local_motion_synthesis: privateMedia.artifact.local_motion_synthesis || false, provider_media_id_persisted: false } } : {}) };
     const sendEvidence = [
       ...(privateMedia ? [
         { type: "TOLA_PRIVATE_MEDIA_DELIVERED", verified: true, media_type: privateMedia.plan.type, artifact_sha256: privateMedia.artifact.sha256, size_bytes: privateMedia.artifact.size_bytes, mime_type: privateMedia.artifact.mime_type, generation_id: outcome.result.generation_id || null, duration_seconds: privateMedia.artifact.duration_seconds || null, resolution: privateMedia.artifact.resolution || null, codec: privateMedia.artifact.codec || null, frame_difference: privateMedia.artifact.frame_difference || null, provider_generated_frames: privateMedia.artifact.provider_generated_frames || false, local_motion_synthesis: privateMedia.artifact.local_motion_synthesis || false, provider_media_id_persisted: false },

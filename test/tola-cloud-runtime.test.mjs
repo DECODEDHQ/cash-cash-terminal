@@ -71,6 +71,97 @@ test("private inbound replay produces one reasoning call and one reply", async t
   assert.equal(receipt.result.duplicate_execution, false);
 });
 
+test("authenticated Muse Spark participates in the existing command tower and exact replay calls neither runtime twice", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-muse-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const calls = { muse: 0, openai: 0, send: 0 };
+  const fetchImpl = async (url, options = {}) => {
+    const target = String(url);
+    if (target === "https://api.meta.ai/v1/responses") {
+      calls.muse += 1;
+      const request = JSON.parse(options.body);
+      assert.equal(request.model, "muse-spark-1.3");
+      assert.equal(request.metadata.producer, "MUSE_REN");
+      assert.deepEqual(request.tools, [{ type: "web_search" }]);
+      return jsonResponse(200, { id: "muse_resp_1", output_text: "Verified Muse research evidence." });
+    }
+    if (target === "https://api.openai.com/v1/responses") {
+      calls.openai += 1;
+      const request = JSON.parse(options.body);
+      assert.match(String(request.input), /Verified Muse research evidence/);
+      return jsonResponse(200, { id: "resp_command_tower_muse_1", output_text: "I completed the research and brought back the result." });
+    }
+    if (target.endsWith("/messages")) {
+      calls.send += 1;
+      const request = JSON.parse(options.body);
+      return jsonResponse(200, { contacts: [{ wa_id: request.to }], messages: [{ id: "wamid.muse-out" }] });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  };
+  const runtime = new TolaCloudRuntime({
+    app: {}, fetchImpl,
+    env: {
+      TOLA_STATE_DIR: stateDir,
+      TOLA_WHATSAPP_API_KEY: "test-provider-token",
+      OPENAI_API_KEY: "test-openai-token",
+      MODEL_API_KEY: "test-meta-model-token",
+      CANON_REVISION: "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358",
+    },
+  });
+  assert.equal(runtime.museCapabilities().authenticated, true);
+  const message = { id: "wamid.muse-in", from: "user:15550001111", type: "text", text: { body: "Research the current result and bring it back." } };
+  const first = await runtime.handleMessage("123456", message, []);
+  assert.equal(first.duplicate, false);
+  const reasoning = runtime.store.get(first.reasoning_job_id);
+  assert.equal(reasoning.result.muse_response_id, "muse_resp_1");
+  assert.deepEqual(calls, { muse: 1, openai: 1, send: 1 });
+  const replay = await runtime.handleMessage("123456", message, []);
+  assert.equal(replay.duplicate, true);
+  assert.equal(replay.duplicate_execution, false);
+  assert.equal(replay.duplicate_reply, false);
+  assert.deepEqual(calls, { muse: 1, openai: 1, send: 1 });
+});
+
+test("Muse Image and Muse Voice use the same authenticated capability registry without persisting credentials", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-muse-media-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(128, 7)]);
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push(String(url));
+    assert.equal(options.headers.authorization, "Bearer test-meta-model-token");
+    if (String(url).endsWith("/images/generations")) {
+      const request = JSON.parse(options.body);
+      assert.equal(request.model, "muse-image-1.0");
+      return jsonResponse(200, { id: "muse_image_1", data: [{ b64_json: jpeg.toString("base64") }] });
+    }
+    if (String(url).endsWith("/asr/transcribe")) {
+      assert.ok(options.body instanceof FormData);
+      return jsonResponse(200, { id: "muse_voice_1", text: "Create the result now." });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  };
+  const runtime = new TolaCloudRuntime({
+    app: {}, fetchImpl,
+    env: {
+      TOLA_STATE_DIR: stateDir,
+      TOLA_WHATSAPP_API_KEY: "test-provider-token",
+      OPENAI_API_KEY: "test-openai-token",
+      MODEL_API_KEY: "test-meta-model-token",
+      CANON_REVISION: "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358",
+    },
+  });
+  const image = await runtime.generateMuseImage({ prompt: "Create a private image", source_image: null }, { A2A_ID: "a2a-muse-image" });
+  assert.equal(image.generation_id, "muse_image_1");
+  assert.equal(image.provider, "meta");
+  assert.equal(image.mime_type, "image/jpeg");
+  const voice = await runtime.transcribeMuseAudio({ bytes: Buffer.from("audio"), mime_type: "audio/ogg", filename: "voice.ogg", sha256: sha256("audio") });
+  assert.equal(voice.response_id, "muse_voice_1");
+  assert.equal(voice.text, "Create the result now.");
+  assert.deepEqual(calls, ["https://api.meta.ai/v1/images/generations", "https://api.meta.ai/v1/asr/transcribe"]);
+  assert.doesNotMatch(JSON.stringify(runtime.liveCapabilityTruth()), /test-meta-model-token/);
+});
+
 test("clear video WANT uses the Meta Muse Video contract and replay performs no duplicate work", async t => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-video-"));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
@@ -265,10 +356,10 @@ test("TOLA behavior contract precedes capability reasoning and survives restart 
     text: { body: "What can u do" },
   });
   assert.equal(first.duplicate, false);
-  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V5_META_MUSE_VIDEO/);
+  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V6_LIVE_MUSE_REGISTRY/);
   assert.match(requests[0].instructions, /CURRENT MESSAGE CLASSIFICATION: CAPABILITY QUESTION/);
   assert.match(requests[0].instructions, /Never give a generic capability list/);
-  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V5_META_MUSE_VIDEO");
+  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V6_LIVE_MUSE_REGISTRY");
   assert.doesNotMatch(JSON.stringify(requests[0]), /META_MUSE_VIDEO_API|TOLA_META_MUSE_VIDEO_API_UNAVAILABLE/);
   assert.equal(sent[0].text.body, "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.");
   firstRuntime.store.db.close();
@@ -331,10 +422,10 @@ test("hydrated image reasoning receives the same TOLA behavior contract", async 
     type: "image",
     image: { id: "media-contract-1", mime_type: "image/jpeg", sha256: digest, caption: "Use this image for the clear WANT." },
   });
-  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V5_META_MUSE_VIDEO/);
+  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V6_LIVE_MUSE_REGISTRY/);
   assert.match(openaiRequest.instructions, /CURRENT MESSAGE CLASSIFICATION: WANT OR CONTINUATION/);
   assert.equal(openaiRequest.input[0].content[1].type, "input_image");
-  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V5_META_MUSE_VIDEO");
+  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V6_LIVE_MUSE_REGISTRY");
 });
 
 test("a migrated local receipt suppresses a pre-cloud provider replay", async t => {
