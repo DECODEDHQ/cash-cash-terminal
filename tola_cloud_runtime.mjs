@@ -47,7 +47,7 @@ const PRIVATE_MEDIA_SCOPE = "PRIVATE_ARTIFACT_CREATE";
 const DEFAULT_VIDEO_MODEL = "fal-ai/kling-video/v2.6/pro/text-to-video";
 const DEFAULT_REPLY = "Tell me what you want. I’ll work out the rest.";
 const CAPABILITY_REPLY = "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.";
-const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V3_GENUINE_VIDEO";
+const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V4_CUSTOMER_SAFE_BLOCKERS";
 const TOLA_BEHAVIOR_CONTRACT = [
   `TOLA BEHAVIOR CONTRACT ${TOLA_BEHAVIOR_CONTRACT_REVISION}. This contract applies to every WhatsApp response and takes priority over generic assistant behavior.`,
   "TOLA is a human-facing execution agent, not a generic chatbot. Speak as TOLA and return only the direct WhatsApp reply.",
@@ -60,7 +60,8 @@ const TOLA_BEHAVIOR_CONTRACT = [
   "Use short WhatsApp-native language: direct acknowledgment, action, result, and at most one necessary question. Do not use email formatting, long signatures, or infrastructure explanations.",
   "Never claim a consequential external action occurred unless verified evidence in the current request proves it occurred.",
   "For a clear image request, invoke the available image creation capability. For a clear video request, invoke only a bound genuine temporal video-generation capability; never substitute an animated still, pan, zoom, slideshow, repeated frame, or image wrapped in MP4.",
-  "If genuine video generation is not currently bound or authorized, return the exact missing provider or authority as a blocker. Never claim video completion merely because an MP4 exists.",
+  "If genuine video generation is not currently available, state only the human-relevant capability or permission blocker. Never expose provider names, model names, environment variables, credentials, internal codes, or infrastructure details.",
+  "Never claim video completion merely because an MP4 exists.",
 ].join("\n");
 
 const now = () => new Date().toISOString();
@@ -155,13 +156,16 @@ function normalizeReply(value, fallback = DEFAULT_REPLY) {
     .trim()
     .slice(0, 4096);
   if (!reply) return fallback;
+  if (/\b(?:FAL_KEY|TOLA_VIDEO_[A-Z0-9_]*|OPENAI_[A-Z0-9_]*|CANON_SHA256|PRIVATE_ARTIFACT_CREATE|FFMPEG)\b/i.test(reply)) {
+    return "Genuine video generation isn’t available yet, so I haven’t sent a fake substitute.";
+  }
   if (/\b(?:i(?:'m| am) an ai assistant|i can(?:not|'t) (?:take real[- ]world actions|generate|create|make|produce|render)|i can only help you think|if you want, i can|ready-to-run prompt|generator prompt)\b/i.test(reply)) return fallback;
   return reply;
 }
 
 function explicitMediaWant(value) {
   const text = String(value || "");
-  const creation = /\b(?:create|make|produce|render|generate|turn)\b/i.test(text);
+  const creation = /\b(?:create|crate|make|produce|render|generate|turn)\b/i.test(text);
   if (!creation) return null;
   if (/\b(?:video|promo|reel|clip|animation)\b/i.test(text)) return "video";
   if (/\b(?:image|picture|photo|graphic|poster|artwork)\b/i.test(text)) return "image";
@@ -183,8 +187,8 @@ function validGeneratedImage(bytes) {
 
 function capabilityFailureReply(error) {
   const code = safeError(error);
-  if (/TOLA_GENUINE_VIDEO_PROVIDER_UNBOUND/i.test(code)) return "Real video generation isn’t connected yet. The smallest unblock is a server-side FAL_KEY for the existing Kling video route; I won’t fake it with an animated still.";
-  if (/TOLA_GENUINE_VIDEO_AUTHORITY_UNBOUND/i.test(code)) return "Real video generation is connected but not authorized for metered use. Enable the existing private video-generation authority; I won’t spend or fake a result without it.";
+  if (/TOLA_GENUINE_VIDEO_PROVIDER_UNBOUND/i.test(code)) return "Genuine video generation isn’t available yet, so I haven’t sent a fake substitute.";
+  if (/TOLA_GENUINE_VIDEO_AUTHORITY_UNBOUND/i.test(code)) return "Genuine video generation needs your approval before I can run it. I haven’t spent anything or sent a fake substitute.";
   if (/TOLA_VIDEO_(?:TEMPORAL|PLAYBACK|CONTAINER|STREAM|ARTIFACT|DOWNLOAD)/i.test(code)) return "A real video was generated, but it failed video or motion validation, so I didn’t send or claim it as complete.";
   if (/TOLA_VIDEO_PROVIDER_GENERATION/i.test(code)) return "The genuine video provider failed to return a valid moving video. No still-image substitute was created or sent.";
   if (/OPENAI_IMAGE_403|VERIFICATION/i.test(code)) return "Image creation is blocked for this OpenAI project until image-model access is enabled. That is the only missing capability.";
@@ -452,6 +456,11 @@ class TolaCloudRuntime {
     return { available: true, provider: "fal", model: this.videoModel, image_to_video_model: this.imageToVideoModel, blocker: null };
   }
 
+  publicVideoAvailability() {
+    const available = this.videoAvailability().available;
+    return { available, state: available ? "AVAILABLE" : "UNAVAILABLE" };
+  }
+
   assertConfig() {
     if (!this.token) throw new Error("TOLA_WHATSAPP_API_KEY_MISSING");
     if (!this.apiKey) throw new Error("OPENAI_API_KEY_MISSING");
@@ -471,7 +480,7 @@ class TolaCloudRuntime {
         last_poll_at: this.lastPollAt,
         tola_contract_revision: TOLA_BEHAVIOR_CONTRACT_REVISION,
         private_media_execution: true,
-        genuine_video_generation: this.videoAvailability(),
+        genuine_video_generation: this.publicVideoAvailability(),
         quoted_reply_context: false,
       });
     });
@@ -1272,7 +1281,7 @@ class TolaCloudRuntime {
       capability_truth: {
         cloud_reasoning: true, whatsapp_private_reply: true,
         private_image_creation: true,
-        private_video_creation: this.videoAvailability(),
+        private_video_creation: this.publicVideoAvailability(),
         chairman_local: this.store.availability("CHAIRMAN_LOCAL").state,
         consequential_actions: "EXACT_AUTHORITY_AND_PAI_REQUIRED",
       },

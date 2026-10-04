@@ -192,13 +192,13 @@ test("video WANT fails closed before image generation when genuine video is unbo
       CANON_REVISION: "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358",
     },
   });
-  const message = { id: "wamid.video-block-in", from: "user:15550001111", type: "text", text: { body: "Create a realistic video of a flying dog. Just do something." } };
+  const message = { id: "wamid.video-block-in", from: "user:15550001111", type: "text", text: { body: "Crate video of lion chasing zebra" } };
   const first = await runtime.handleMessage("123456", message, []);
   assert.equal(first.duplicate, false);
   assert.deepEqual(calls, { openai: 0, uploads: 0, sends: 1 });
   assert.equal(sent.type, "text");
-  assert.match(sent.text.body, /Real video generation isn’t connected yet/);
-  assert.match(sent.text.body, /won’t fake it with an animated still/);
+  assert.equal(sent.text.body, "Genuine video generation isn’t available yet, so I haven’t sent a fake substitute.");
+  assert.doesNotMatch(sent.text.body, /FAL_KEY|provider|model|environment|credential/i);
   assert.equal(fs.existsSync(path.join(stateDir, "deliverables", "tola")), false);
   const replay = await runtime.handleMessage("123456", message, []);
   assert.equal(replay.duplicate, true);
@@ -269,10 +269,11 @@ test("TOLA behavior contract precedes capability reasoning and survives restart 
     text: { body: "What can u do" },
   });
   assert.equal(first.duplicate, false);
-  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V3_GENUINE_VIDEO/);
+  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V4_CUSTOMER_SAFE_BLOCKERS/);
   assert.match(requests[0].instructions, /CURRENT MESSAGE CLASSIFICATION: CAPABILITY QUESTION/);
   assert.match(requests[0].instructions, /Never give a generic capability list/);
-  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V3_GENUINE_VIDEO");
+  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V4_CUSTOMER_SAFE_BLOCKERS");
+  assert.doesNotMatch(JSON.stringify(requests[0]), /FAL_KEY|fal-ai|TOLA_GENUINE_VIDEO_PROVIDER_UNBOUND/);
   assert.equal(sent[0].text.body, "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.");
   firstRuntime.store.db.close();
 
@@ -334,10 +335,10 @@ test("hydrated image reasoning receives the same TOLA behavior contract", async 
     type: "image",
     image: { id: "media-contract-1", mime_type: "image/jpeg", sha256: digest, caption: "Use this image for the clear WANT." },
   });
-  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V3_GENUINE_VIDEO/);
+  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V4_CUSTOMER_SAFE_BLOCKERS/);
   assert.match(openaiRequest.instructions, /CURRENT MESSAGE CLASSIFICATION: WANT OR CONTINUATION/);
   assert.equal(openaiRequest.input[0].content[1].type, "input_image");
-  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V3_GENUINE_VIDEO");
+  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V4_CUSTOMER_SAFE_BLOCKERS");
 });
 
 test("a migrated local receipt suppresses a pre-cloud provider replay", async t => {
