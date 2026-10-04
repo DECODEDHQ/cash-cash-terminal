@@ -374,6 +374,48 @@ class TolaCloudRuntime {
       response.json({ ok: true, job, source, outbound, events: this.store.db.prepare("SELECT * FROM job_events WHERE job_id IN (?,?) ORDER BY event_id").all(job.job_id, source?.job_id || "") });
     });
 
+    this.app.get("/tola-cloud/admin/recent", (request, response) => {
+      if (!this.adminAuthorized(request)) return response.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+      const requested = Number.parseInt(String(request.query?.limit || "10"), 10);
+      const limit = Number.isSafeInteger(requested) ? Math.max(1, Math.min(50, requested)) : 10;
+      const rows = this.store.db.prepare("SELECT job_id,created_at,updated_at,constraints,result,checkpoint FROM jobs WHERE worker_type='TOLA_WHATSAPP_INBOUND' ORDER BY created_at DESC LIMIT ?").all(limit);
+      const transactions = rows.map(row => {
+        const constraints = parse(row.constraints, {});
+        const result = parse(row.result, {});
+        const checkpoint = parse(row.checkpoint, {});
+        const reference = constraints.whatsapp_reference || {};
+        const reasoning = this.store.db.prepare("SELECT job_id,result FROM jobs WHERE parent_job_id=? AND worker_type='A2A_COMMAND_TOWER' ORDER BY created_at DESC LIMIT 1").get(row.job_id);
+        const reasoningResult = parse(reasoning?.result, {});
+        const outbound = result.outbound || {};
+        return {
+          received_at: row.created_at,
+          updated_at: row.updated_at,
+          provider_agent_id: reference.agent_id || null,
+          inbound_provider_message_id: reference.message_id || result.inbound_message_id || null,
+          participant_id: reference.participant_id || null,
+          relationship_id: reference.relationship_id || result.relationship_id || null,
+          channel_thread_id: reference.thread_id || outbound.channel_thread_id || null,
+          A2A_ID: outbound.A2A_ID || reasoningResult.A2A_ID || result.A2A_ID || null,
+          OPPORTUNITY_ID: outbound.OPPORTUNITY_ID || reasoningResult.OPPORTUNITY_ID || result.OPPORTUNITY_ID || null,
+          WANT_ID: outbound.WANT_ID || reasoningResult.WANT_ID || result.WANT_ID || null,
+          job_id: row.job_id,
+          reasoning_job_id: reasoning?.job_id || outbound.reasoning_job_id || null,
+          openai_response_id: reasoningResult.openai_response_id || outbound.openai_response_id || null,
+          reasoning_result_ref: reasoningResult.reasoning_result_ref || outbound.reasoning_result_ref || null,
+          receipt_id: result.outbound_receipt_id || outbound.receipt_id || null,
+          outbound_provider_message_id: outbound.outbound_provider_message_id || null,
+          delivery_state: outbound.delivery_state || null,
+          duplicate_count: Number(checkpoint.duplicate_count || 0),
+        };
+      });
+      response.json({
+        ok: true,
+        chairman_local: this.store.availability("CHAIRMAN_LOCAL"),
+        cursor_updated_at: this.cursor.updated_at,
+        transactions,
+      });
+    });
+
     this.app.post("/tola-cloud/admin/replay", async (request, response) => {
       if (!this.adminAuthorized(request)) return response.status(401).json({ ok: false, error: "UNAUTHORIZED" });
       try {
