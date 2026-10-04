@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,6 +20,37 @@ test("persistence status requires a real non-root mount", () => {
   assert.equal(isMountedPath("/tmp/chairman-cloud-state", mountInfo), false);
   assert.equal(isMountedPath("/var/data/chairman/jobs", mountInfo), true);
   assert.equal(isMountedPath("/unmounted/path", "29 23 0:25 / / rw,relatime - overlay overlay rw"), false);
+});
+
+test("REN signed HTTP authentication accepts secure timestamp and signature encodings", t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-ren-auth-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const x25519 = crypto.generateKeyPairSync("x25519");
+  const ed25519 = crypto.generateKeyPairSync("ed25519");
+  const runtime = new TolaCloudRuntime({
+    app: {},
+    env: { TOLA_STATE_DIR: stateDir },
+    renPublicKeys: {
+      x25519: x25519.publicKey.export({ type: "spki", format: "der" }).toString("base64"),
+      ed25519: ed25519.publicKey.export({ type: "spki", format: "der" }).toString("base64"),
+    },
+  });
+  const nonce = "01234567-89ab-cdef-0123-456789abcdef";
+  for (const [timestamp, encoding] of [
+    [String(Date.now()), "base64"],
+    [String(Math.floor(Date.now() / 1000)), "base64url"],
+    [new Date().toISOString(), "hex"],
+  ]) {
+    const request = { method: "GET", originalUrl: "/tola-cloud/ren/tasks", headers: { "x-ren-timestamp": timestamp, "x-ren-nonce": nonce }, body: {} };
+    const canonical = ["GET", request.originalUrl, timestamp, nonce, sha256("{}")].join("\n");
+    const signature = crypto.sign(null, Buffer.from(canonical), ed25519.privateKey);
+    request.headers["x-ren-signature"] = encoding === "hex" ? signature.toString("hex") : signature.toString(encoding);
+    assert.equal(runtime.renHttpAuthorized(request), true, `${encoding} signature with ${timestamp} should verify`);
+    assert.equal(request.renAuthError, null);
+  }
+  const stale = { method: "GET", originalUrl: "/tola-cloud/ren/tasks", headers: { "x-ren-timestamp": "0", "x-ren-nonce": nonce, "x-ren-signature": "AA==" }, body: {} };
+  assert.equal(runtime.renHttpAuthorized(stale), false);
+  assert.equal(stale.renAuthError, "REN_TIMESTAMP_INVALID");
 });
 
 test("private inbound replay produces one reasoning call and one reply", async t => {

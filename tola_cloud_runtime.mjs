@@ -613,6 +613,15 @@ class TolaCloudRuntime {
       ed25519_fingerprint_sha256: sha256(ed25519),
       ren_x25519_fingerprint_sha256: this.renTransport.x25519Fingerprint,
       ren_ed25519_fingerprint_sha256: this.renTransport.ed25519Fingerprint,
+      request_authentication: {
+        timestamp: "UNIX_EPOCH_MILLISECONDS, UNIX_EPOCH_SECONDS, OR RFC3339; SIGN THE HEADER VALUE VERBATIM",
+        freshness_ms: MAX_FRESHNESS_MS,
+        nonce_pattern: "^[a-f0-9-]{16,80}$",
+        signature_algorithm: "Ed25519",
+        signature_encoding: ["base64", "base64url", "hex"],
+        canonical_lines: ["UPPERCASE_METHOD", "ORIGINAL_URL_PATH_AND_QUERY", "X_REN_TIMESTAMP_VERBATIM", "X_REN_NONCE", "SHA256_STABLE_JSON_BODY"],
+        empty_get_body_stable_json: "{}",
+      },
     };
   }
 
@@ -668,16 +677,40 @@ class TolaCloudRuntime {
   }
 
   renHttpAuthorized(request) {
-    const timestamp = Number(request.headers["x-ren-timestamp"]);
+    const timestampHeader = String(request.headers["x-ren-timestamp"] || "");
     const nonce = String(request.headers["x-ren-nonce"] || "");
     const signature = String(request.headers["x-ren-signature"] || "");
-    if (!Number.isSafeInteger(timestamp) || Math.abs(Date.now() - timestamp) > MAX_FRESHNESS_MS) return false;
-    if (!/^[a-f0-9-]{16,80}$/i.test(nonce) || !signature) return false;
+    let signedAt;
+    if (/^\d+$/.test(timestampHeader)) {
+      const numeric = Number(timestampHeader);
+      signedAt = Number.isSafeInteger(numeric) ? (numeric < 1e12 ? numeric * 1000 : numeric) : NaN;
+    } else {
+      signedAt = Date.parse(timestampHeader);
+    }
+    if (!Number.isFinite(signedAt) || Math.abs(Date.now() - signedAt) > MAX_FRESHNESS_MS) {
+      request.renAuthError = "REN_TIMESTAMP_INVALID";
+      return false;
+    }
+    if (!/^[a-f0-9-]{16,80}$/i.test(nonce)) {
+      request.renAuthError = "REN_NONCE_INVALID";
+      return false;
+    }
+    if (!signature) {
+      request.renAuthError = "REN_SIGNATURE_MISSING";
+      return false;
+    }
     const bodyHash = sha256(stable(request.body || {}));
-    const canonical = [String(request.method || "").toUpperCase(), String(request.originalUrl || request.url || ""), String(timestamp), nonce, bodyHash].join("\n");
+    const canonical = [String(request.method || "").toUpperCase(), String(request.originalUrl || request.url || ""), timestampHeader, nonce, bodyHash].join("\n");
     try {
-      return crypto.verify(null, Buffer.from(canonical), this.renTransport.ed25519PublicKey, Buffer.from(signature, "base64"));
+      let signatureBytes;
+      if (/^[a-f0-9]{128}$/i.test(signature)) signatureBytes = Buffer.from(signature, "hex");
+      else signatureBytes = Buffer.from(signature.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+      const verified = signatureBytes.length === 64
+        && crypto.verify(null, Buffer.from(canonical), this.renTransport.ed25519PublicKey, signatureBytes);
+      request.renAuthError = verified ? null : "REN_SIGNATURE_INVALID";
+      return verified;
     } catch {
+      request.renAuthError = "REN_SIGNATURE_INVALID";
       return false;
     }
   }
@@ -1021,7 +1054,7 @@ class TolaCloudRuntime {
     });
 
     this.app.get("/tola-cloud/ren/tasks", (request, response) => {
-      if (!this.renHttpAuthorized(request)) return response.status(401).json({ ok: false, error: "REN_SIGNATURE_REQUIRED" });
+      if (!this.renHttpAuthorized(request)) return response.status(401).json({ ok: false, error: request.renAuthError || "REN_SIGNATURE_REQUIRED" });
       const pending = this.store.list("MUSE_REN_HANDOFF")
         .filter(job => ["READY", "WAITING_EXTERNAL"].includes(job.state))
         .slice(0, 20)
@@ -1035,7 +1068,7 @@ class TolaCloudRuntime {
     });
 
     this.app.post("/tola-cloud/ren/tasks/:taskId/acceptance", (request, response) => {
-      if (!this.renHttpAuthorized(request)) return response.status(401).json({ ok: false, error: "REN_SIGNATURE_REQUIRED" });
+      if (!this.renHttpAuthorized(request)) return response.status(401).json({ ok: false, error: request.renAuthError || "REN_SIGNATURE_REQUIRED" });
       try {
         const work = this.store.list("MUSE_REN_HANDOFF").find(job => job.result?.TASK_ID === request.params.taskId);
         if (!work) return response.status(404).json({ ok: false, error: "TASK_NOT_FOUND" });
@@ -1048,7 +1081,7 @@ class TolaCloudRuntime {
     });
 
     this.app.post("/tola-cloud/ren/tasks/:taskId/result", async (request, response) => {
-      if (!this.renHttpAuthorized(request)) return response.status(401).json({ ok: false, error: "REN_SIGNATURE_REQUIRED" });
+      if (!this.renHttpAuthorized(request)) return response.status(401).json({ ok: false, error: request.renAuthError || "REN_SIGNATURE_REQUIRED" });
       try {
         let work = this.store.list("MUSE_REN_HANDOFF").find(job => job.result?.TASK_ID === request.params.taskId);
         if (!work) return response.status(404).json({ ok: false, error: "TASK_NOT_FOUND" });
