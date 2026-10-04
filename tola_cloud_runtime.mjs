@@ -1,10 +1,14 @@
 import crypto from "node:crypto";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { promisify } from "node:util";
 
 const PROVIDER_BASE = "https://api.whatsapp.com/agent/v1";
 const OPENAI_URL = "https://api.openai.com/v1/responses";
+const execFileAsync = promisify(execFile);
 const IDENTITIES = new Set([
   "TOLA_WHATSAPP",
   "TOLA",
@@ -36,9 +40,12 @@ const MEDIA_LIMITS = Object.freeze({
   audio: 32 * 1024 * 1024,
   document: 32 * 1024 * 1024,
 });
+const WHATSAPP_OUTBOUND_MEDIA_LIMIT = 16 * 1024 * 1024;
+const PRIVATE_MEDIA_CAPABILITY_VERSION = "private-media-v1";
+const PRIVATE_MEDIA_SCOPE = "PRIVATE_ARTIFACT_CREATE";
 const DEFAULT_REPLY = "Tell me what you want. I’ll work out the rest.";
 const CAPABILITY_REPLY = "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.";
-const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_RESPONSE_LAW_2026-10-04";
+const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V2";
 const TOLA_BEHAVIOR_CONTRACT = [
   `TOLA BEHAVIOR CONTRACT ${TOLA_BEHAVIOR_CONTRACT_REVISION}. This contract applies to every WhatsApp response and takes priority over generic assistant behavior.`,
   "TOLA is a human-facing execution agent, not a generic chatbot. Speak as TOLA and return only the direct WhatsApp reply.",
@@ -50,6 +57,7 @@ const TOLA_BEHAVIOR_CONTRACT = [
   "Ask one short question only when information, identity, consent, payment, authentication, rights, legal approval, material authority, or another genuine dependency is missing.",
   "Use short WhatsApp-native language: direct acknowledgment, action, result, and at most one necessary question. Do not use email formatting, long signatures, or infrastructure explanations.",
   "Never claim a consequential external action occurred unless verified evidence in the current request proves it occurred.",
+  "For a clear request to create an image or video, invoke the available private creation capability. Never answer with a prompt, storyboard, plan, or a claim that you cannot create it.",
 ].join("\n");
 
 const now = () => new Date().toISOString();
@@ -144,8 +152,39 @@ function normalizeReply(value, fallback = DEFAULT_REPLY) {
     .trim()
     .slice(0, 4096);
   if (!reply) return fallback;
-  if (/\b(?:i(?:'m| am) an ai assistant|i can(?:not|'t) take real[- ]world actions|i can only help you think|if you want, i can)\b/i.test(reply)) return fallback;
+  if (/\b(?:i(?:'m| am) an ai assistant|i can(?:not|'t) (?:take real[- ]world actions|generate|create|make|produce|render)|i can only help you think|if you want, i can|ready-to-run prompt|generator prompt)\b/i.test(reply)) return fallback;
   return reply;
+}
+
+function explicitMediaWant(value) {
+  const text = String(value || "");
+  const creation = /\b(?:create|make|produce|render|generate|turn)\b/i.test(text);
+  if (!creation) return null;
+  if (/\b(?:video|promo|reel|clip|animation)\b/i.test(text)) return "video";
+  if (/\b(?:image|picture|photo|graphic|poster|artwork)\b/i.test(text)) return "image";
+  return null;
+}
+
+function isMediaContinuation(value) {
+  const text = String(value || "").trim();
+  return text.length <= 600 && /\b(?:realistic|cinematic|cartoon|stylized|vertical|landscape|portrait|square|use (?:it|that)|same (?:image|artwork)|go ahead|do it|just do|make it|yes|continue|proceed)\b/i.test(text);
+}
+
+function validGeneratedImage(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 64 || bytes.length > 25 * 1024 * 1024) return false;
+  const head = bytes.subarray(0, 16);
+  return head.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))
+    || head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    || head.subarray(0, 4).toString("ascii") === "RIFF";
+}
+
+function capabilityFailureReply(error) {
+  const code = safeError(error);
+  if (/OPENAI_IMAGE_403|VERIFICATION/i.test(code)) return "Image creation is blocked for this OpenAI project until image-model access is enabled. That is the only missing capability.";
+  if (/OPENAI_IMAGE_429|RATE/i.test(code)) return "Image creation is temporarily rate-limited. The WANT is preserved; retrying the request is the only remaining step.";
+  if (/FFMPEG|RENDERED_VIDEO|VIDEO_SOURCE/i.test(code)) return "The visual was created, but the video render failed. The cloud video renderer is the exact blocked step.";
+  if (/WHATSAPP_MEDIA_UPLOAD|WHATSAPP_SEND/i.test(code)) return "The result was created, but WhatsApp media delivery failed. The WANT and finished artifact are preserved.";
+  return "The creation route hit a verified runtime failure. The WANT is preserved; no completion was claimed.";
 }
 
 function atomicJson(file, value) {
@@ -308,6 +347,14 @@ class CloudStore {
       .run(JSON.stringify(result), JSON.stringify(evidence), now(), key, jobId);
   }
 
+  failAction(jobId, key, error) {
+    const result = { status: "FAILED", error: safeError(error), execution_count: 1, failed_at: now() };
+    const evidence = [{ type: "ACTION_FAILED", verified: true, error: result.error, at: result.failed_at }];
+    this.db.prepare("UPDATE action_receipts SET status='FAILED',result=?,evidence=?,completed_at=? WHERE idempotency_key=? AND job_id=?")
+      .run(JSON.stringify(result), JSON.stringify(evidence), result.failed_at, key, jobId);
+    return { result, evidence };
+  }
+
   receipt(key) {
     const row = this.db.prepare("SELECT * FROM action_receipts WHERE idempotency_key=?").get(key);
     return row ? { ...row, evidence: parse(row.evidence, []), result: parse(row.result) } : null;
@@ -362,6 +409,7 @@ class TolaCloudRuntime {
     this.adminToken = env.TOLA_CLOUD_ADMIN_TOKEN || "";
     this.localNodeToken = env.TOLA_LOCAL_NODE_TOKEN || "";
     this.model = env.OPENAI_COMMAND_TOWER_MODEL || "gpt-5.4-mini";
+    this.imageModel = env.OPENAI_IMAGE_MODEL || "gpt-image-2.5-flare";
     this.canonRevision = env.CANON_REVISION || "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358";
     this.stateDir = env.TOLA_STATE_DIR || "/tmp/chairman-cloud-state";
     this.store = new CloudStore(this.stateDir);
@@ -389,6 +437,9 @@ class TolaCloudRuntime {
         state_dir_persistent: isMountedPath(this.stateDir),
         status: this.enabled ? cloud.state : "STAGED_DISABLED",
         last_poll_at: this.lastPollAt,
+        tola_contract_revision: TOLA_BEHAVIOR_CONTRACT_REVISION,
+        private_media_execution: true,
+        quoted_reply_context: false,
       });
     });
 
@@ -677,6 +728,337 @@ class TolaCloudRuntime {
       .sort((a, b) => String(b.completed_at).localeCompare(String(a.completed_at)))[0]?.result?.openai_response_id || null;
   }
 
+  relationshipHistory(source, limit = 8) {
+    const relationshipId = source.constraints?.whatsapp_reference?.relationship_id;
+    return this.store.list("TOLA_WHATSAPP_INBOUND")
+      .filter(job => job.constraints?.whatsapp_reference?.relationship_id === relationshipId)
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+      .slice(-limit)
+      .map(job => ({ job_id: job.job_id, intent: job.intent, media: job.constraints?.whatsapp_media || null }));
+  }
+
+  privateMediaPlan(source, media) {
+    const history = this.relationshipHistory(source);
+    let explicit = explicitMediaWant(source.intent);
+    let anchor = source.intent;
+    if (!explicit && isMediaContinuation(source.intent)) {
+      for (let index = history.length - 2; index >= 0; index -= 1) {
+        const candidate = explicitMediaWant(history[index].intent);
+        if (candidate) {
+          explicit = candidate;
+          anchor = history[index].intent;
+          break;
+        }
+      }
+    }
+    if (!explicit) return null;
+    const continuity = history
+      .slice(-5)
+      .map(item => item.intent)
+      .filter(Boolean)
+      .join("\n");
+    return {
+      type: explicit,
+      prompt: [anchor, source.intent === anchor ? null : source.intent, continuity]
+        .filter(Boolean)
+        .join("\n")
+        .slice(0, 12000),
+      source_image: media?.processing_path === "OPENAI_INPUT_IMAGE" ? media : null,
+      continuity_count: history.length,
+    };
+  }
+
+  validatePrivateMediaAuthority(source) {
+    const reference = source.constraints?.whatsapp_reference;
+    const pai = source.constraints?.PAI || {};
+    const authority = source.constraints?.authority || {};
+    if (!reference || reference.account_identity !== "TOLA") throw new Error("TOLA_PRIVATE_MEDIA_REFERENCE_REQUIRED");
+    if (pai.identity !== "TOLA_WHATSAPP" || pai.authorized !== true || !hasScope(pai.scopes, PRIVATE_MEDIA_SCOPE)) throw new Error("TOLA_PRIVATE_MEDIA_PAI_DENIED");
+    if (authority.authorized !== true || !hasScope(authority.scopes, PRIVATE_MEDIA_SCOPE)) throw new Error("TOLA_PRIVATE_MEDIA_AUTHORITY_DENIED");
+    if (pai.exact_recipient !== reference.participant_id || authority.exact_recipient !== reference.participant_id || authority.exact_thread !== reference.thread_id || authority.exact_message_id !== reference.message_id) {
+      throw new Error("TOLA_PRIVATE_MEDIA_AUTHORITY_SCOPE_MISMATCH");
+    }
+    return reference;
+  }
+
+  async generatePrivateImage(plan, envelope, previousResponseId = null) {
+    const inputText = [
+      "Create the actual private visual asset requested below. Do not return a plan, prompt, storyboard, or explanation.",
+      "Use a portrait 9:16-friendly composition, strong subject clarity, polished production quality, and no added text unless the WANT explicitly requests text.",
+      `WANT AND CONTINUITY:\n${plan.prompt}`,
+    ].join("\n\n");
+    const input = plan.source_image
+      ? [{ role: "user", content: [
+          { type: "input_text", text: inputText },
+          { type: "input_image", image_url: `data:${plan.source_image.mime_type};base64,${plan.source_image.bytes.toString("base64")}`, detail: "high" },
+        ] }]
+      : inputText;
+    const request = {
+      model: this.model,
+      store: true,
+      instructions: "Create the requested image now using the image-generation tool. Return the generated image, not advice about creating it.",
+      input,
+      tools: [{
+        type: "image_generation",
+        model: this.imageModel,
+        action: plan.source_image ? "edit" : previousResponseId ? "auto" : "generate",
+        size: "1024x1536",
+        quality: "low",
+        output_format: "jpeg",
+        output_compression: 86,
+      }],
+      tool_choice: { type: "image_generation" },
+      metadata: {
+        a2a_id: envelope.A2A_ID,
+        opportunity_id: envelope.OPPORTUNITY_ID,
+        producer: envelope.producer_identity,
+        canon_revision: sha256(envelope.CANON_REVISION),
+        capability: PRIVATE_MEDIA_CAPABILITY_VERSION,
+      },
+    };
+    if (previousResponseId) request.previous_response_id = previousResponseId;
+    const response = await this.fetch(OPENAI_URL, {
+      method: "POST",
+      headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify(request),
+      signal: AbortSignal.timeout(180000),
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(`OPENAI_IMAGE_${response.status}:${String(body?.error?.code || body?.error?.type || "UNKNOWN").slice(0, 80)}`);
+    const call = body?.output?.find(item => item?.type === "image_generation_call" && typeof item.result === "string");
+    const bytes = call?.result ? Buffer.from(call.result, "base64") : null;
+    if (!body?.id || !validGeneratedImage(bytes)) throw new Error("OPENAI_IMAGE_RESULT_INVALID");
+    return {
+      bytes,
+      mime_type: "image/jpeg",
+      filename: "tola-created-image.jpg",
+      openai_response_id: body.id,
+      revised_prompt_sha256: call.revised_prompt ? sha256(call.revised_prompt) : null,
+      request_sha256: sha256(request),
+    };
+  }
+
+  async confirmPrivateMediaExecution(plan, envelope, previousResponseId = null) {
+    const inputText = `Privately execute this media WANT now. Confirm the current image is available as the render source.\n${plan.prompt}`;
+    const input = plan.source_image
+      ? [{ role: "user", content: [
+          { type: "input_text", text: inputText },
+          { type: "input_image", image_url: `data:${plan.source_image.mime_type};base64,${plan.source_image.bytes.toString("base64")}`, detail: "high" },
+        ] }]
+      : inputText;
+    const request = {
+      model: this.model,
+      store: true,
+      instructions: "You are the private execution controller. Verify the supplied source is usable and reply with only EXECUTE. Do not address the customer.",
+      input,
+      metadata: {
+        a2a_id: envelope.A2A_ID,
+        producer: envelope.producer_identity,
+        canon_revision: sha256(envelope.CANON_REVISION),
+        capability: PRIVATE_MEDIA_CAPABILITY_VERSION,
+      },
+    };
+    if (previousResponseId) request.previous_response_id = previousResponseId;
+    const response = await this.fetch(OPENAI_URL, {
+      method: "POST",
+      headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify(request),
+      signal: AbortSignal.timeout(90000),
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(`OPENAI_MEDIA_EXECUTION_${response.status}:${String(body?.error?.code || body?.error?.type || "UNKNOWN").slice(0, 80)}`);
+    if (!body?.id || responseText(body).toUpperCase() !== "EXECUTE") throw new Error("OPENAI_MEDIA_EXECUTION_CONFIRMATION_INVALID");
+    return { openai_response_id: body.id, request_sha256: sha256(request) };
+  }
+
+  async renderPrivateVideo(image, source) {
+    if (!Buffer.isBuffer(image?.bytes) || !validGeneratedImage(image.bytes)) throw new Error("TOLA_VIDEO_SOURCE_IMAGE_INVALID");
+    const artifactDir = path.join(this.stateDir, "deliverables", "tola");
+    fs.mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
+    const artifactId = shortHash(`${PRIVATE_MEDIA_CAPABILITY_VERSION}:${source.idempotency_key}`);
+    const artifactFile = path.join(artifactDir, `${artifactId}.mp4`);
+    const validate = () => {
+      const bytes = fs.readFileSync(artifactFile);
+      if (!bytes.subarray(0, Math.min(64, bytes.length)).includes(Buffer.from("ftyp")) || bytes.length <= 0 || bytes.length > WHATSAPP_OUTBOUND_MEDIA_LIMIT) {
+        throw new Error("TOLA_RENDERED_VIDEO_INVALID");
+      }
+      return {
+        bytes,
+        artifact_ref: `deliverable:${artifactId}`,
+        mime_type: "video/mp4",
+        filename: "tola-created-video.mp4",
+        sha256: sha256(bytes),
+        size_bytes: bytes.length,
+        duration_seconds: 6,
+        width: 720,
+        height: 1280,
+        codec: "H.264",
+        audio: false,
+      };
+    };
+    if (fs.existsSync(artifactFile)) return validate();
+    const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-video-"));
+    const inputFile = path.join(temporaryDir, "source-image");
+    const outputFile = path.join(temporaryDir, "result.mp4");
+    fs.writeFileSync(inputFile, image.bytes, { mode: 0o600 });
+    const filter = [
+      "scale=720:1280:force_original_aspect_ratio=increase",
+      "crop=720:1280",
+      "zoompan=z='1+0.035*on/179':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=180:s=720x1280:fps=30",
+      "fade=t=in:st=0:d=0.35",
+      "fade=t=out:st=5.5:d=0.5",
+      "format=yuv420p",
+    ].join(",");
+    try {
+      await execFileAsync(this.env.FFMPEG_PATH || "/usr/bin/ffmpeg", [
+        "-hide_banner", "-loglevel", "error", "-y",
+        "-loop", "1", "-i", inputFile,
+        "-vf", filter,
+        "-t", "6", "-r", "30", "-an", "-threads", "1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", outputFile,
+      ], { timeout: 180000, maxBuffer: 1024 * 1024 });
+      fs.copyFileSync(outputFile, artifactFile, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(artifactFile, 0o600);
+      return validate();
+    } finally {
+      fs.rmSync(temporaryDir, { recursive: true, force: true });
+    }
+  }
+
+  async executePrivateMedia(source, envelope, media) {
+    const plan = this.privateMediaPlan(source, media);
+    if (!plan) return null;
+    this.validatePrivateMediaAuthority(source);
+    const executionKey = `capability:${PRIVATE_MEDIA_CAPABILITY_VERSION}:${shortHash(source.idempotency_key)}`;
+    const execution = this.store.createJob({
+      parent_job_id: source.job_id,
+      root_job_id: source.root_job_id,
+      delta_id: envelope.OPPORTUNITY_ID,
+      worker_type: "TOLA_PRIVATE_MEDIA_EXECUTION",
+      owner: "OPENAI_COMMAND_TOWER_RUNTIME",
+      intent: `Execute the authorized private ${plan.type} WANT`,
+      success_condition: "A real private media artifact is created and evidenced before TOLA reports completion",
+      idempotency_key: executionKey,
+      priority: 92,
+      state: "RUNNING",
+      constraints: {
+        actionable: true,
+        capability: PRIVATE_MEDIA_CAPABILITY_VERSION,
+        media_type: plan.type,
+        authority_scope: PRIVATE_MEDIA_SCOPE,
+        exact_relationship_id: envelope.RELATIONSHIP_ID,
+        exact_provider_message_id: envelope.provider_message_id,
+      },
+      provenance: { source: "TOLA_CLOUD_CAPABILITY_ROUTER", a2a_id: envelope.A2A_ID, canon_revision: this.canonRevision },
+      completed_at: null,
+    }).job;
+    const claim = this.store.beginAction(execution.job_id, executionKey);
+    if (!claim.execute) throw new Error(`TOLA_PRIVATE_MEDIA_ACTION_${claim.reason}`);
+    try {
+    const previousResponseId = this.priorResponse(envelope.TRANSACTION_ID, "");
+    const generated = plan.source_image && plan.type === "video"
+      ? (() => ({
+          bytes: Buffer.from(plan.source_image.bytes),
+          mime_type: plan.source_image.mime_type,
+          filename: plan.source_image.filename,
+          source_media_sha256: plan.source_image.sha256,
+        }))()
+      : await this.generatePrivateImage(plan, envelope, previousResponseId);
+    if (!generated.openai_response_id) {
+      const confirmation = await this.confirmPrivateMediaExecution(plan, envelope, previousResponseId);
+      generated.openai_response_id = confirmation.openai_response_id;
+      generated.request_sha256 = confirmation.request_sha256;
+    }
+    const artifact = plan.type === "video"
+      ? await this.renderPrivateVideo(generated, source)
+      : (() => {
+          const artifactDir = path.join(this.stateDir, "deliverables", "tola");
+          fs.mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
+          const artifactId = shortHash(`${PRIVATE_MEDIA_CAPABILITY_VERSION}:${source.idempotency_key}`);
+          const file = path.join(artifactDir, `${artifactId}.jpg`);
+          if (!fs.existsSync(file)) fs.writeFileSync(file, generated.bytes, { mode: 0o600, flag: "wx" });
+          const bytes = fs.readFileSync(file);
+          return { bytes, artifact_ref: `deliverable:${artifactId}`, mime_type: "image/jpeg", filename: "tola-created-image.jpg", sha256: sha256(bytes), size_bytes: bytes.length };
+        })();
+    const result = {
+      status: "PRIVATE_MEDIA_CREATED",
+      capability: PRIVATE_MEDIA_CAPABILITY_VERSION,
+      media_type: plan.type,
+      artifact_ref: artifact.artifact_ref,
+      artifact_sha256: artifact.sha256,
+      size_bytes: artifact.size_bytes,
+      mime_type: artifact.mime_type,
+      openai_response_id: generated.openai_response_id,
+      execution_count: 1,
+      terminal_state: "EXECUTED",
+    };
+    const evidence = [{
+      type: "TOLA_PRIVATE_MEDIA_CREATED",
+      verified: true,
+      media_type: plan.type,
+      artifact_sha256: artifact.sha256,
+      size_bytes: artifact.size_bytes,
+      mime_type: artifact.mime_type,
+      source_media_sha256: generated.source_media_sha256 || null,
+      openai_response_id: generated.openai_response_id,
+      request_sha256: generated.request_sha256,
+      authority_scope: PRIVATE_MEDIA_SCOPE,
+      at: now(),
+    }];
+    this.store.finishAction(execution.job_id, executionKey, result, evidence);
+    this.store.updateJob(execution.job_id, {
+      state: "COMPLETED",
+      completed_at: now(),
+      result,
+      evidence,
+      terminal_state: "EXECUTED",
+      terminal_evidence: { executor_invoked: "OPENAI_COMMAND_TOWER_RUNTIME", external_action_performed: `PRIVATE_${plan.type.toUpperCase()}_CREATED`, authority_result: "EXACT_PRIVATE_CREATION_AUTHORIZED" },
+    });
+    this.store.appendEffect("ACTION_EXECUTED", {
+      job_id: execution.job_id,
+      opportunity_id: envelope.OPPORTUNITY_ID,
+      want_id: envelope.WANT_ID,
+      producer_identity: "OPENAI_COMMAND_TOWER_RUNTIME",
+      destination: envelope.RELATIONSHIP_ID,
+      authority_state: "EXACT_PRIVATE_CREATION_AUTHORIZED",
+      message_ref: { A2A_ID: envelope.A2A_ID, inbound_provider_message_id: envelope.provider_message_id },
+      evidence_ref: `artifact:${artifact.sha256}`,
+    });
+    return {
+      plan,
+      execution_job_id: execution.job_id,
+      execution_receipt_id: executionKey,
+      artifact,
+      openai_response_id: generated.openai_response_id,
+      reply: plan.type === "video" ? "Done — I created the video." : "Done — I created the image.",
+      evidence,
+    };
+    } catch (error) {
+      const failure = this.store.failAction(execution.job_id, executionKey, error);
+      this.store.updateJob(execution.job_id, {
+        state: "FAILED",
+        completed_at: now(),
+        result: failure.result,
+        evidence: failure.evidence,
+        terminal_state: "FAILED",
+        terminal_evidence: { executor_invoked: "OPENAI_COMMAND_TOWER_RUNTIME", external_action_performed: "NONE", authority_result: "AUTHORIZED_EXECUTION_FAILED", error: failure.result.error },
+      });
+      this.store.appendEffect("ACTION_FAILED", {
+        job_id: execution.job_id,
+        opportunity_id: envelope.OPPORTUNITY_ID,
+        want_id: envelope.WANT_ID,
+        producer_identity: "OPENAI_COMMAND_TOWER_RUNTIME",
+        destination: envelope.RELATIONSHIP_ID,
+        authority_state: "EXACT_PRIVATE_CREATION_AUTHORIZED",
+        message_ref: { A2A_ID: envelope.A2A_ID, inbound_provider_message_id: envelope.provider_message_id },
+        evidence_ref: `capability-failure:${executionKey}`,
+        error: failure.result.error,
+      });
+      throw error;
+    }
+  }
+
   async reason(job, source, media) {
     const envelope = job.constraints.a2a_envelope;
     this.validateEnvelope(envelope, source);
@@ -688,6 +1070,7 @@ class TolaCloudRuntime {
       payload: source.intent,
       capability_truth: {
         cloud_reasoning: true, whatsapp_private_reply: true,
+        private_image_creation: true, private_video_creation: true,
         chairman_local: this.store.availability("CHAIRMAN_LOCAL").state,
         consequential_actions: "EXACT_AUTHORITY_AND_PAI_REQUIRED",
       },
@@ -757,7 +1140,46 @@ class TolaCloudRuntime {
   }
 
   async sendReply(reference, text) {
-    const response = await this.provider("/messages", { method: "POST", body: { messaging_product: "whatsapp", to: reference.participant_id, type: "text", context: { message_id: reference.message_id }, text: { body: text, preview_url: false } }, timeoutMs: 60000 });
+    const response = await this.provider("/messages", { method: "POST", body: { messaging_product: "whatsapp", to: reference.participant_id, type: "text", text: { body: text, preview_url: false } }, timeoutMs: 60000 });
+    const messageId = response.body?.messages?.[0]?.id;
+    if (!/^wamid\./.test(String(messageId || ""))) throw new Error("WHATSAPP_SEND_RECEIPT_MESSAGE_ID_MISSING");
+    return { provider_message_id: messageId, recipient_id: response.body?.contacts?.[0]?.wa_id || reference.participant_id };
+  }
+
+  async uploadMedia(bytes, { mimeType, filename }) {
+    if (!Buffer.isBuffer(bytes) || !bytes.length) throw new Error("TOLA_OUTBOUND_MEDIA_EMPTY");
+    if (bytes.length > WHATSAPP_OUTBOUND_MEDIA_LIMIT) throw new Error("TOLA_OUTBOUND_MEDIA_TOO_LARGE");
+    const form = new FormData();
+    form.set("messaging_product", "whatsapp");
+    form.set("type", mimeType);
+    form.set("file", new Blob([bytes], { type: mimeType }), filename);
+    let response;
+    try {
+      response = await this.fetch(`${PROVIDER_BASE}/media`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${this.token}` },
+        body: form,
+        signal: AbortSignal.timeout(120000),
+      });
+    } catch { throw new Error("WHATSAPP_MEDIA_UPLOAD_FAILED"); }
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(`WHATSAPP_MEDIA_UPLOAD_${response.status}:${String(body?.error?.code || "UNKNOWN").slice(0, 40)}`);
+    if (typeof body?.id !== "string" || !body.id || body.id.length > 256) throw new Error("WHATSAPP_MEDIA_UPLOAD_ID_MISSING");
+    return { media_id: body.id };
+  }
+
+  async sendMediaReply(reference, mediaType, mediaId, caption) {
+    if (!new Set(["image", "video"]).has(mediaType)) throw new Error("TOLA_OUTBOUND_MEDIA_TYPE_DENIED");
+    const response = await this.provider("/messages", {
+      method: "POST",
+      body: {
+        messaging_product: "whatsapp",
+        to: reference.participant_id,
+        type: mediaType,
+        [mediaType]: { id: mediaId, caption: String(caption || "").slice(0, 1024) },
+      },
+      timeoutMs: 60000,
+    });
     const messageId = response.body?.messages?.[0]?.id;
     if (!/^wamid\./.test(String(messageId || ""))) throw new Error("WHATSAPP_SEND_RECEIPT_MESSAGE_ID_MISSING");
     return { provider_message_id: messageId, recipient_id: response.body?.contacts?.[0]?.wa_id || reference.participant_id };
@@ -799,7 +1221,7 @@ class TolaCloudRuntime {
       worker_type: "TOLA_WHATSAPP_INBOUND", owner: "TOLA_WHATSAPP", intent,
       success_condition: "Private WhatsApp message admitted to shared cloud jobs/action_receipts/EFFECTS with exact continuity references",
       idempotency_key: reference.action_id, priority: 95,
-      constraints: { actionable: false, channel: "whatsapp", whatsapp_reference: reference, whatsapp_media: mediaMetadata, PAI: { identity: "TOLA_WHATSAPP", authorized: true, scopes: ["A2A_REASONING", "WHATSAPP_PRIVATE_REPLY"], exact_recipient: reference.participant_id, exact_message_id: reference.message_id }, authority: { authorized: true, scopes: ["A2A_REASONING", "WHATSAPP_PRIVATE_REPLY"], exact_recipient: reference.participant_id, exact_thread: reference.thread_id, exact_message_id: reference.message_id, denied_effects: ["bulk_outreach", "public_distribution", "spending", "payment"] } },
+      constraints: { actionable: false, channel: "whatsapp", whatsapp_reference: reference, whatsapp_media: mediaMetadata, PAI: { identity: "TOLA_WHATSAPP", authorized: true, scopes: ["A2A_REASONING", "WHATSAPP_PRIVATE_REPLY", PRIVATE_MEDIA_SCOPE], exact_recipient: reference.participant_id, exact_message_id: reference.message_id }, authority: { authorized: true, scopes: ["A2A_REASONING", "WHATSAPP_PRIVATE_REPLY", PRIVATE_MEDIA_SCOPE], exact_recipient: reference.participant_id, exact_thread: reference.thread_id, exact_message_id: reference.message_id, denied_effects: ["bulk_outreach", "public_distribution", "spending", "payment"] } },
       provenance: { source: "WHATSAPP_AGENT_PLATFORM", relationship_id: reference.relationship_id, provider_message_id: reference.message_id, canon_revision: this.canonRevision },
       result: inboundResult, evidence: [{ type: "TOLA_WHATSAPP_RECEIVED", verified: true, provider_message_id: reference.message_id, relationship_id: reference.relationship_id, at: now() }, ...(media ? [{ type: "TOLA_WHATSAPP_MEDIA_FETCHED", verified: true, mime_type: media.mime_type, size_bytes: media.size_bytes, sha256: media.sha256, bytes_persisted: false }] : [])], terminal_state: "EXECUTED",
     }).job;
@@ -833,22 +1255,98 @@ class TolaCloudRuntime {
     const reasoningAction = this.store.beginAction(reasoning.job_id, envelope.idempotency_key);
     if (!reasoningAction.execute) return { duplicate: true, job_id: source.job_id, a2a_id: a2aId, duplicate_execution: false, duplicate_reply: false };
     this.store.event(reasoning.job_id, "A2A_FIREWALL_ACCEPTED", { A2A_ID: a2aId, producer_identity: "TOLA_WHATSAPP", canon_revision: this.canonRevision, surface_permission: envelope.surface_permission });
-    const outcome = await this.reason(reasoning, source, media);
+    let privateMedia = null;
+    let capabilityError = null;
+    try { privateMedia = await this.executePrivateMedia(source, envelope, media); }
+    catch (error) { capabilityError = error; }
+    const outcome = privateMedia ? {
+      result: {
+        A2A_ID: envelope.A2A_ID,
+        OPPORTUNITY_ID: envelope.OPPORTUNITY_ID,
+        WANT_ID: envelope.WANT_ID,
+        RELATIONSHIP_ID: envelope.RELATIONSHIP_ID,
+        CHANNEL_THREAD_ID: envelope.CHANNEL_THREAD_ID,
+        provider_message_id: envelope.provider_message_id,
+        producer_identity: envelope.producer_identity,
+        recipient_identity: envelope.recipient_identity,
+        CANON_REVISION: envelope.CANON_REVISION,
+        reasoning_result_ref: privateMedia.openai_response_id
+          ? `openai:response:${privateMedia.openai_response_id}`
+          : `artifact:${privateMedia.artifact.sha256}`,
+        openai_response_id: privateMedia.openai_response_id,
+        previous_response_id: this.priorResponse(envelope.TRANSACTION_ID, reasoning.job_id),
+        reasoning_output: privateMedia.reply,
+        next_action: "TOLA_DELIVER_PRIVATE_MEDIA_TO_ORIGINAL_WHATSAPP_THREAD",
+        capability_execution_job_id: privateMedia.execution_job_id,
+        capability_receipt_id: privateMedia.execution_receipt_id,
+        receipt: { idempotency_key: envelope.idempotency_key, status: "COMPLETED", execution_count: 1, completed_at: now() },
+        terminal_state: "EXECUTED",
+        terminal_evidence: { executor_invoked: "OPENAI_COMMAND_TOWER_RUNTIME", authority_result: "EXACT_PRIVATE_CREATION_AUTHORIZED", external_action_performed: `PRIVATE_${privateMedia.plan.type.toUpperCase()}_CREATED`, downstream_effects_authorized: true },
+      },
+      evidence: [{
+        type: "A2A_CAPABILITY_EXECUTION_RESULT",
+        verified: true,
+        openai_response_id: privateMedia.openai_response_id,
+        capability: PRIVATE_MEDIA_CAPABILITY_VERSION,
+        capability_execution_job_id: privateMedia.execution_job_id,
+        capability_receipt_id: privateMedia.execution_receipt_id,
+        artifact_sha256: privateMedia.artifact.sha256,
+        media_type: privateMedia.plan.type,
+        tola_contract_revision: TOLA_BEHAVIOR_CONTRACT_REVISION,
+        at: now(),
+      }],
+    } : capabilityError ? {
+      result: {
+        A2A_ID: envelope.A2A_ID,
+        OPPORTUNITY_ID: envelope.OPPORTUNITY_ID,
+        WANT_ID: envelope.WANT_ID,
+        RELATIONSHIP_ID: envelope.RELATIONSHIP_ID,
+        CHANNEL_THREAD_ID: envelope.CHANNEL_THREAD_ID,
+        provider_message_id: envelope.provider_message_id,
+        producer_identity: envelope.producer_identity,
+        recipient_identity: envelope.recipient_identity,
+        CANON_REVISION: envelope.CANON_REVISION,
+        reasoning_result_ref: `capability-failure:${shortHash(`${envelope.A2A_ID}:${safeError(capabilityError)}`)}`,
+        openai_response_id: null,
+        previous_response_id: this.priorResponse(envelope.TRANSACTION_ID, reasoning.job_id),
+        reasoning_output: capabilityFailureReply(capabilityError),
+        next_action: "RETURN_EXACT_CAPABILITY_BLOCK_TO_ORIGINAL_WHATSAPP_THREAD",
+        receipt: { idempotency_key: envelope.idempotency_key, status: "COMPLETED_WITH_BLOCK", execution_count: 1, completed_at: now() },
+        terminal_state: "WAITING_DEPENDENCY",
+        terminal_evidence: { executor_invoked: "OPENAI_COMMAND_TOWER_RUNTIME", authority_result: "AUTHORIZED_EXECUTION_FAILED", external_action_performed: "NONE", downstream_effects_authorized: false, error: safeError(capabilityError) },
+      },
+      evidence: [{ type: "A2A_CAPABILITY_EXECUTION_BLOCKED", verified: true, error: safeError(capabilityError), capability: PRIVATE_MEDIA_CAPABILITY_VERSION, at: now() }],
+    } : await this.reason(reasoning, source, media);
     this.store.finishAction(reasoning.job_id, envelope.idempotency_key, outcome.result, outcome.evidence);
-    this.store.updateJob(reasoning.job_id, { state: "COMPLETED", completed_at: now(), result: outcome.result, evidence: outcome.evidence, terminal_state: "EXECUTED", terminal_evidence: outcome.result.terminal_evidence });
-    this.store.appendEffect("RESPONSE_RECEIVED", { job_id: reasoning.job_id, opportunity_id: opportunityId, want_id: wantId, producer_identity: "TOLA_WHATSAPP", destination: "TOLA_WHATSAPP", counterparty: "OPENAI_COMMAND_TOWER_RUNTIME", authority_state: "REASONING_ONLY_ALLOWED", message_ref: { A2A_ID: a2aId, reasoning_result_ref: outcome.result.reasoning_result_ref }, next_action: outcome.result.next_action, evidence_ref: `a2a-result:${a2aId}:${outcome.result.openai_response_id}` });
+    this.store.updateJob(reasoning.job_id, { state: "COMPLETED", completed_at: now(), result: outcome.result, evidence: outcome.evidence, terminal_state: outcome.result.terminal_state, terminal_evidence: outcome.result.terminal_evidence });
+    this.store.appendEffect("RESPONSE_RECEIVED", { job_id: reasoning.job_id, opportunity_id: opportunityId, want_id: wantId, producer_identity: "TOLA_WHATSAPP", destination: "TOLA_WHATSAPP", counterparty: "OPENAI_COMMAND_TOWER_RUNTIME", authority_state: privateMedia ? "EXACT_PRIVATE_CREATION_AUTHORIZED" : capabilityError ? "AUTHORIZED_EXECUTION_FAILED" : "REASONING_ONLY_ALLOWED", message_ref: { A2A_ID: a2aId, reasoning_result_ref: outcome.result.reasoning_result_ref }, next_action: outcome.result.next_action, evidence_ref: `a2a-result:${a2aId}:${outcome.result.openai_response_id || shortHash(outcome.result.reasoning_result_ref)}` });
 
     const reply = isOpening(intent) ? DEFAULT_REPLY : isCapabilityQuestion(intent) ? CAPABILITY_REPLY : normalizeReply(outcome.result.reasoning_output);
-    const sendKey = `whatsapp:send:${reference.agent_id}:${shortHash(reference.action_id)}`;
+    const sendKey = privateMedia
+      ? `whatsapp:send-media:${PRIVATE_MEDIA_CAPABILITY_VERSION}:${reference.agent_id}:${shortHash(reference.action_id)}`
+      : `whatsapp:send:${reference.agent_id}:${shortHash(reference.action_id)}`;
     const sendAction = this.store.beginAction(source.job_id, sendKey);
     if (!sendAction.execute) return { duplicate: true, job_id: source.job_id, a2a_id: a2aId, duplicate_execution: false, duplicate_reply: false };
-    const sent = await this.sendReply(reference, reply);
-    const sendResult = { status: "WHATSAPP_REPLY_ACCEPTED", inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id, channel_thread_id: reference.thread_id, A2A_ID: a2aId, OPPORTUNITY_ID: opportunityId, WANT_ID: wantId, job_id: source.job_id, reasoning_job_id: reasoning.job_id, openai_response_id: outcome.result.openai_response_id, reasoning_result_ref: outcome.result.reasoning_result_ref, receipt_id: sendKey, delivery_state: "accepted", duplicate_execution: false, duplicate_reply: false, chairman_availability: this.store.availability("CHAIRMAN_LOCAL").state };
-    const sendEvidence = [{ type: "TOLA_WHATSAPP_SEND_ACCEPTED", verified: true, inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id, same_thread: sent.recipient_id === reference.participant_id, at: now() }];
+    let sent;
+    if (privateMedia) {
+      const uploaded = await this.uploadMedia(privateMedia.artifact.bytes, { mimeType: privateMedia.artifact.mime_type, filename: privateMedia.artifact.filename });
+      sent = await this.sendMediaReply(reference, privateMedia.plan.type, uploaded.media_id, reply);
+    } else {
+      sent = await this.sendReply(reference, reply);
+    }
+    const sendResult = { status: "WHATSAPP_REPLY_ACCEPTED", inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id, channel_thread_id: reference.thread_id, A2A_ID: a2aId, OPPORTUNITY_ID: opportunityId, WANT_ID: wantId, job_id: source.job_id, reasoning_job_id: reasoning.job_id, openai_response_id: outcome.result.openai_response_id, reasoning_result_ref: outcome.result.reasoning_result_ref, receipt_id: sendKey, delivery_state: "accepted", duplicate_execution: false, duplicate_reply: false, chairman_availability: this.store.availability("CHAIRMAN_LOCAL").state, ...(privateMedia ? { capability_execution_job_id: privateMedia.execution_job_id, capability_receipt_id: privateMedia.execution_receipt_id, media_delivery: { type: privateMedia.plan.type, mime_type: privateMedia.artifact.mime_type, size_bytes: privateMedia.artifact.size_bytes, sha256: privateMedia.artifact.sha256, provider_media_id_persisted: false } } : {}) };
+    const sendEvidence = [
+      ...(privateMedia ? [
+        { type: "TOLA_PRIVATE_MEDIA_DELIVERED", verified: true, media_type: privateMedia.plan.type, artifact_sha256: privateMedia.artifact.sha256, size_bytes: privateMedia.artifact.size_bytes, mime_type: privateMedia.artifact.mime_type, provider_media_id_persisted: false },
+        { type: "TOLA_WHATSAPP_MEDIA_UPLOADED", verified: true, media_type: privateMedia.plan.type, artifact_sha256: privateMedia.artifact.sha256, provider_media_id_persisted: false },
+      ] : []),
+      { type: "TOLA_WHATSAPP_SEND_ACCEPTED", verified: true, inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id, same_thread: sent.recipient_id === reference.participant_id, quoted_message: false, at: now() },
+    ];
     this.store.finishAction(source.job_id, sendKey, sendResult, sendEvidence);
     this.store.updateJob(source.job_id, { result: { ...inboundResult, outbound: sendResult, outbound_receipt_id: sendKey }, evidence: [...source.evidence, ...sendEvidence] });
     this.store.event(source.job_id, "TOLA_WHATSAPP_REPLY_SENT", sendResult);
-    this.store.appendEffect("OUTBOUND_SENT", { job_id: source.job_id, opportunity_id: opportunityId, want_id: wantId, producer_identity: "TOLA_WHATSAPP", channel: "whatsapp", destination: reference.relationship_id, counterparty: "TOLA", authority_state: "EXACT_PRIVATE_REPLY_AUTHORIZED", message_ref: { inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id }, evidence_ref: `whatsapp-send:${sent.provider_message_id}` });
+    this.store.appendEffect("OUTBOUND_SENT", { job_id: source.job_id, opportunity_id: opportunityId, want_id: wantId, producer_identity: "TOLA_WHATSAPP", channel: "whatsapp", destination: reference.relationship_id, counterparty: "TOLA", authority_state: "EXACT_PRIVATE_REPLY_AUTHORIZED", message_ref: { inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id }, evidence_ref: `whatsapp-send:${sent.provider_message_id}`, media_type: privateMedia?.plan.type || null });
+    if (privateMedia?.artifact?.bytes) privateMedia.artifact.bytes.fill(0);
     if (media?.bytes) media.bytes.fill(0);
     return { duplicate: false, job_id: source.job_id, reasoning_job_id: reasoning.job_id, a2a_id: a2aId, provider_message_id: sent.provider_message_id, openai_response_id: outcome.result.openai_response_id, receipt_id: sendKey };
   }
@@ -942,7 +1440,7 @@ class TolaCloudRuntime {
 
   processStatuses(statuses = []) {
     let updated = 0;
-    const receipts = this.store.db.prepare("SELECT * FROM action_receipts WHERE idempotency_key LIKE 'whatsapp:send:%' AND status='COMPLETED'").all();
+    const receipts = this.store.db.prepare("SELECT * FROM action_receipts WHERE (idempotency_key LIKE 'whatsapp:send:%' OR idempotency_key LIKE 'whatsapp:send-media:%') AND status='COMPLETED'").all();
     for (const status of statuses) {
       const row = receipts.find(item => parse(item.result, {})?.outbound_provider_message_id === status.id);
       if (!row) continue;

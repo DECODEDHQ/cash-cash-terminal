@@ -33,7 +33,7 @@ test("private inbound replay produces one reasoning call and one reply", async t
       calls.send += 1;
       const request = JSON.parse(options.body);
       assert.equal(request.to, "user:15550001111");
-      assert.equal(request.context.message_id, "wamid.inbound-cloud-test");
+      assert.equal(request.context, undefined);
       return jsonResponse(200, { contacts: [{ wa_id: "user:15550001111" }], messages: [{ id: "wamid.outbound-cloud-test" }] });
     }
     throw new Error(`unexpected URL ${url}`);
@@ -68,6 +68,76 @@ test("private inbound replay produces one reasoning call and one reply", async t
   const receipt = runtime.store.receipt(first.receipt_id);
   assert.equal(receipt.status, "COMPLETED");
   assert.equal(receipt.result.duplicate_execution, false);
+});
+
+test("clear video WANT executes a real private media route and replay performs no duplicate work", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-video-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const generatedImage = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(128, 1)]);
+  const videoBytes = Buffer.concat([Buffer.alloc(4), Buffer.from("ftypisom"), Buffer.alloc(1024, 2)]);
+  const calls = { openai: 0, renders: 0, uploads: 0, sends: 0 };
+  const outbound = [];
+  const fetchImpl = async (url, options = {}) => {
+    const target = String(url);
+    if (target.includes("api.openai.com/v1/responses")) {
+      calls.openai += 1;
+      const request = JSON.parse(options.body);
+      assert.equal(request.tools[0].type, "image_generation");
+      assert.equal(request.tool_choice.type, "image_generation");
+      assert.match(String(request.input), /flying dog/i);
+      return jsonResponse(200, {
+        id: "resp_private_video_1",
+        output: [{ type: "image_generation_call", result: generatedImage.toString("base64"), revised_prompt: "A realistic flying dog." }],
+      });
+    }
+    if (target.endsWith("/media") && options.method === "POST") {
+      calls.uploads += 1;
+      assert.ok(options.body instanceof FormData);
+      return jsonResponse(200, { id: "provider-media-private" });
+    }
+    if (target.endsWith("/messages")) {
+      calls.sends += 1;
+      const request = JSON.parse(options.body);
+      outbound.push(request);
+      return jsonResponse(200, { contacts: [{ wa_id: request.to }], messages: [{ id: "wamid.private-video-out" }] });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  };
+  const runtime = new TolaCloudRuntime({
+    app: {},
+    fetchImpl,
+    env: {
+      TOLA_STATE_DIR: stateDir,
+      TOLA_WHATSAPP_API_KEY: "test-provider-token",
+      OPENAI_API_KEY: "test-openai-token",
+      CANON_REVISION: "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358",
+    },
+  });
+  runtime.renderPrivateVideo = async () => {
+    calls.renders += 1;
+    return { bytes: Buffer.from(videoBytes), artifact_ref: "deliverable:test", mime_type: "video/mp4", filename: "tola-created-video.mp4", sha256: sha256(videoBytes), size_bytes: videoBytes.length, duration_seconds: 6, width: 720, height: 1280, codec: "H.264", audio: false };
+  };
+  const message = { id: "wamid.private-video-in", from: "user:15550001111", type: "text", text: { body: "Create a realistic video of a flying dog. Just do something." } };
+  const first = await runtime.handleMessage("123456", message, []);
+  assert.equal(first.duplicate, false);
+  assert.equal(first.openai_response_id, "resp_private_video_1");
+  assert.deepEqual(calls, { openai: 1, renders: 1, uploads: 1, sends: 1 });
+  assert.equal(outbound[0].type, "video");
+  assert.equal(outbound[0].context, undefined);
+  assert.equal(outbound[0].video.caption, "Done — I created the video.");
+  const source = runtime.store.get(first.job_id);
+  assert.equal(source.result.outbound.media_delivery.type, "video");
+  assert.equal(source.result.outbound.media_delivery.sha256, sha256(videoBytes));
+  const capabilityReceipt = runtime.store.receipt(source.result.outbound.capability_receipt_id);
+  assert.equal(capabilityReceipt.status, "COMPLETED");
+  assert.equal(capabilityReceipt.result.execution_count, 1);
+  assert.equal(JSON.stringify(capabilityReceipt).includes("provider-media-private"), false);
+
+  const replay = await runtime.handleMessage("123456", message, []);
+  assert.equal(replay.duplicate, true);
+  assert.equal(replay.duplicate_execution, false);
+  assert.equal(replay.duplicate_reply, false);
+  assert.deepEqual(calls, { openai: 1, renders: 1, uploads: 1, sends: 1 });
 });
 
 test("TOLA behavior contract precedes capability reasoning and survives restart continuity", async t => {
@@ -111,10 +181,10 @@ test("TOLA behavior contract precedes capability reasoning and survives restart 
     text: { body: "What can u do" },
   });
   assert.equal(first.duplicate, false);
-  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_RESPONSE_LAW_2026-10-04/);
+  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V2/);
   assert.match(requests[0].instructions, /CURRENT MESSAGE CLASSIFICATION: CAPABILITY QUESTION/);
   assert.match(requests[0].instructions, /Never give a generic capability list/);
-  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_RESPONSE_LAW_2026-10-04");
+  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V2");
   assert.equal(sent[0].text.body, "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.");
   firstRuntime.store.db.close();
 
@@ -176,10 +246,10 @@ test("hydrated image reasoning receives the same TOLA behavior contract", async 
     type: "image",
     image: { id: "media-contract-1", mime_type: "image/jpeg", sha256: digest, caption: "Use this image for the clear WANT." },
   });
-  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_RESPONSE_LAW_2026-10-04/);
+  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V2/);
   assert.match(openaiRequest.instructions, /CURRENT MESSAGE CLASSIFICATION: WANT OR CONTINUATION/);
   assert.equal(openaiRequest.input[0].content[1].type, "input_image");
-  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_RESPONSE_LAW_2026-10-04");
+  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V2");
 });
 
 test("a migrated local receipt suppresses a pre-cloud provider replay", async t => {
