@@ -488,8 +488,15 @@ class TolaCloudRuntime {
       if (!this.localAuthorized(request)) return response.status(401).json({ ok: false, error: "UNAUTHORIZED" });
       const keys = Array.isArray(request.body?.idempotency_keys) ? request.body.idempotency_keys.map(String).slice(0, 5000) : [];
       const completed = keys.filter(key => this.store.receipt(key)?.status === "COMPLETED");
+      const cloudCompletedReceipts = this.store.db.prepare("SELECT idempotency_key,job_id,created_at,completed_at FROM action_receipts WHERE status='COMPLETED' AND (idempotency_key LIKE 'whatsapp:%' OR idempotency_key LIKE 'a2a:%') ORDER BY completed_at DESC LIMIT 5000").all();
       const receiptId = `local-reconcile:${sha256(keys).slice(0, 40)}`;
-      const result = { completed, incomplete: keys.filter(key => !completed.includes(key)), duplicate_execution_count: 0, reconciled_at: now() };
+      const result = {
+        completed,
+        incomplete: keys.filter(key => !completed.includes(key)),
+        cloud_completed_receipts: cloudCompletedReceipts,
+        duplicate_execution_count: 0,
+        reconciled_at: now(),
+      };
       const job = this.store.createJob({
         worker_type: "CHAIRMAN_LOCAL_RECONCILIATION",
         owner: "CHAIRMAN_LOCAL",
