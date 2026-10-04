@@ -5,6 +5,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { parse } from "csv-parse/sync";
+import { createTolaCloudRuntime } from "./tola_cloud_runtime.mjs";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -990,6 +991,11 @@ app.post("/csv-import", (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 
+const tolaCloud = createTolaCloudRuntime({ app });
+
 app.listen(PORT, () => {
   log("BOOT", { port: PORT, mission: state.mission });
+  tolaCloud.start().catch(error => {
+    console.error(String(error?.message || error).replace(/[^A-Z0-9_:.-]/gi, "_").slice(0, 180));
+  });
 });

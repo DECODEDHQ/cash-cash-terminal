@@ -5,3 +5,7 @@ services:
     plan: starter
     autoDeploy: true
     healthCheckPath: /health
+    disk:
+      name: chairman-shared-state
+      mountPath: /var/data/chairman
+      sizeGB: 1

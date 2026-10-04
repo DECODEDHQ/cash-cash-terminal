@@ -1,0 +1,181 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { TolaCloudRuntime, sha256 } from "../tola_cloud_runtime.mjs";
+
+function jsonResponse(status, body) {
+  return { ok: status >= 200 && status < 300, status, json: async () => body };
+}
+
+test("private inbound replay produces one reasoning call and one reply", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-test-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const calls = { openai: 0, send: 0 };
+  const fetchImpl = async (url, options = {}) => {
+    if (String(url).includes("api.openai.com/v1/responses")) {
+      calls.openai += 1;
+      return jsonResponse(200, { id: "resp_cloud_test_1", output_text: "I found the harmless result and brought it back here." });
+    }
+    if (String(url).endsWith("/messages")) {
+      calls.send += 1;
+      const request = JSON.parse(options.body);
+      assert.equal(request.to, "user:15550001111");
+      assert.equal(request.context.message_id, "wamid.inbound-cloud-test");
+      return jsonResponse(200, { contacts: [{ wa_id: "user:15550001111" }], messages: [{ id: "wamid.outbound-cloud-test" }] });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  };
+  const runtime = new TolaCloudRuntime({
+    app: {},
+    fetchImpl,
+    env: {
+      TOLA_CLOUD_ENABLED: "0",
+      TOLA_STATE_DIR: stateDir,
+      TOLA_WHATSAPP_API_KEY: "test-provider-token",
+      OPENAI_API_KEY: "test-openai-token",
+      TOLA_CLOUD_ADMIN_TOKEN: "test-admin-token",
+      TOLA_LOCAL_NODE_TOKEN: "test-local-token",
+      CANON_REVISION: "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358",
+    },
+  });
+  const message = { id: "wamid.inbound-cloud-test", from: "user:15550001111", type: "text", text: { body: "Find the current time in Los Angeles." } };
+  const first = await runtime.handleMessage("123456", message, []);
+  assert.equal(first.duplicate, false);
+  assert.equal(first.provider_message_id, "wamid.outbound-cloud-test");
+  assert.equal(first.openai_response_id, "resp_cloud_test_1");
+  const replay = await runtime.handleMessage("123456", message, []);
+  assert.equal(replay.duplicate, true);
+  assert.equal(replay.duplicate_execution, false);
+  assert.equal(replay.duplicate_reply, false);
+  assert.deepEqual(calls, { openai: 1, send: 1 });
+  const source = runtime.store.get(first.job_id);
+  assert.equal(source.constraints.whatsapp_reference.producer_identity, "TOLA_WHATSAPP");
+  assert.equal(source.result.outbound.relationship_id, source.constraints.whatsapp_reference.relationship_id);
+  assert.equal(source.checkpoint.duplicate_count, 1);
+  const receipt = runtime.store.receipt(first.receipt_id);
+  assert.equal(receipt.status, "COMPLETED");
+  assert.equal(receipt.result.duplicate_execution, false);
+});
+
+test("firewall rejects stale Canon and consequential action without authority", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-firewall-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const runtime = new TolaCloudRuntime({ app: {}, fetchImpl: async () => { throw new Error("not called"); }, env: { TOLA_STATE_DIR: stateDir } });
+  const reference = {
+    provider: "WHATSAPP_AGENT_PLATFORM", channel: "whatsapp", account_identity: "TOLA", producer_identity: "TOLA_WHATSAPP",
+    agent_id: "123", participant_id: "user:1", thread_id: "user:1", relationship_id: "whatsapp-thread:test",
+    message_id: "wamid.test", reply_context_message_id: "wamid.test", action_id: "whatsapp:inbound:test",
+  };
+  const source = runtime.store.createJob({ worker_type: "TOLA_WHATSAPP_INBOUND", owner: "TOLA_WHATSAPP", intent: "harmless", success_condition: "accepted", idempotency_key: reference.action_id, constraints: { whatsapp_reference: reference }, result: { terminal_state: "EXECUTED" }, terminal_state: "EXECUTED" }).job;
+  const issued = new Date().toISOString();
+  const base = {
+    A2A_ID: "a2a-test", OPPORTUNITY_ID: "opp-test", WANT_ID: "want-test", TRANSACTION_ID: "tx-test",
+    RELATIONSHIP_ID: reference.relationship_id, CHANNEL_THREAD_ID: reference.thread_id, provider_message_id: reference.message_id,
+    producer_identity: "TOLA_WHATSAPP", recipient_identity: "OPENAI_COMMAND_TOWER_RUNTIME",
+    CANON_REVISION: runtime.canonRevision, created_at: issued, ttl_ms: 60000, idempotency_key: "a2a:a2a-test",
+    action_class: "RESOLVE", payload_ref: { kind: "JOB_INTENT", job_id: source.job_id, sha256: sha256("harmless") },
+    PAI: { identity: "TOLA_WHATSAPP", scopes: ["A2A_REASONING"] }, authority: { scopes: ["A2A_REASONING"] },
+    surface_permission: "WHATSAPP_PRIVATE_SAME_THREAD",
+  };
+  assert.throws(() => runtime.validateEnvelope({ ...base, CANON_REVISION: "CANON_SHA256:" + "0".repeat(64) }, source), /A2A_CANON_REVISION_STALE/);
+  assert.throws(() => runtime.validateEnvelope({ ...base, action_class: "EXECUTE" }, source), /A2A_EXECUTE_AUTHORITY_REQUIRED/);
+});
+
+test("an existing STARTED receipt is never authorized a second time", t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-action-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const runtime = new TolaCloudRuntime({ app: {}, env: { TOLA_STATE_DIR: stateDir } });
+  const job = runtime.store.createJob({
+    worker_type: "TEST",
+    owner: "TEST",
+    intent: "test",
+    success_condition: "test",
+    idempotency_key: "job:test-action",
+  }).job;
+  const first = runtime.store.beginAction(job.job_id, "action:test");
+  const second = runtime.store.beginAction(job.job_id, "action:test");
+  assert.equal(first.execute, true);
+  assert.equal(first.reason, "CLAIMED");
+  assert.equal(second.execute, false);
+  assert.equal(second.reason, "IN_PROGRESS");
+});
+
+test("credential-shaped inbound text is rejected without persistence or model transmission", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-credential-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const calls = { openai: 0, send: 0 };
+  const fetchImpl = async url => {
+    if (String(url).includes("api.openai.com")) {
+      calls.openai += 1;
+      throw new Error("model must not be called");
+    }
+    if (String(url).endsWith("/messages")) {
+      calls.send += 1;
+      return jsonResponse(200, { contacts: [{ wa_id: "user:15550001111" }], messages: [{ id: "wamid.credential-warning" }] });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  };
+  const runtime = new TolaCloudRuntime({
+    app: {},
+    fetchImpl,
+    env: { TOLA_STATE_DIR: stateDir, TOLA_WHATSAPP_API_KEY: "test-provider-token" },
+  });
+  const synthetic = `OPENAI_API_KEY=sk-${"A".repeat(24)}`;
+  const result = await runtime.handleMessage("123456", {
+    id: "wamid.credential-input",
+    from: "user:15550001111",
+    type: "text",
+    text: { body: synthetic },
+  });
+  assert.equal(result.rejected_credential_input, true);
+  assert.deepEqual(calls, { openai: 0, send: 1 });
+  const persisted = [
+    fs.readFileSync(path.join(stateDir, "value-provenance", "events.jsonl"), "utf8"),
+    JSON.stringify(runtime.store.get(result.job_id)),
+    JSON.stringify(runtime.store.receipt(result.receipt_id)),
+  ].join("\n");
+  assert.equal(persisted.includes(synthetic), false);
+  assert.equal(persisted.includes(`sk-${"A".repeat(24)}`), false);
+});
+
+test("media download denies redirects and streams with the declared hard limit", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-media-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const byte = Buffer.from("x");
+  const hash = sha256(byte);
+  let redirectMode = null;
+  const runtime = new TolaCloudRuntime({
+    app: {},
+    env: { TOLA_STATE_DIR: stateDir, TOLA_WHATSAPP_API_KEY: "test-provider-token" },
+    fetchImpl: async (url, options = {}) => {
+      if (String(url).includes("/media/")) {
+        return jsonResponse(200, { mime_type: "image/jpeg", file_size: 1, sha256: hash, url: "https://cdn.whatsapp.net/item" });
+      }
+      redirectMode = options.redirect;
+      return new Response(byte, { status: 200 });
+    },
+  });
+  const media = await runtime.fetchMedia({ type: "image", image: { id: "media-1", mime_type: "image/jpeg", sha256: hash } });
+  assert.equal(redirectMode, "manual");
+  assert.equal(media.size_bytes, 1);
+
+  const oversized = new TolaCloudRuntime({
+    app: {},
+    env: { TOLA_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-media-large-")), TOLA_WHATSAPP_API_KEY: "test-provider-token" },
+    fetchImpl: async url => String(url).includes("/media/")
+      ? jsonResponse(200, { mime_type: "image/jpeg", file_size: 1, sha256: hash, url: "https://cdn.whatsapp.net/item" })
+      : new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(new Uint8Array([120, 120]));
+            controller.close();
+          },
+        }), { status: 200 }),
+  });
+  t.after(() => fs.rmSync(oversized.stateDir, { recursive: true, force: true }));
+  await assert.rejects(
+    oversized.fetchMedia({ type: "image", image: { id: "media-2", mime_type: "image/jpeg", sha256: hash } }),
+    /WHATSAPP_MEDIA_RESPONSE_SIZE_EXCEEDED/,
+  );
+});
