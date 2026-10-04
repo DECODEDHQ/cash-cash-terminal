@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
+import { createFalClient } from "@fal-ai/client";
 
 const PROVIDER_BASE = "https://api.whatsapp.com/agent/v1";
 const OPENAI_URL = "https://api.openai.com/v1/responses";
@@ -41,11 +42,12 @@ const MEDIA_LIMITS = Object.freeze({
   document: 32 * 1024 * 1024,
 });
 const WHATSAPP_OUTBOUND_MEDIA_LIMIT = 16 * 1024 * 1024;
-const PRIVATE_MEDIA_CAPABILITY_VERSION = "private-media-v1";
+const PRIVATE_MEDIA_CAPABILITY_VERSION = "private-media-v2-genuine-video";
 const PRIVATE_MEDIA_SCOPE = "PRIVATE_ARTIFACT_CREATE";
+const DEFAULT_VIDEO_MODEL = "fal-ai/kling-video/v2.6/pro/text-to-video";
 const DEFAULT_REPLY = "Tell me what you want. I’ll work out the rest.";
 const CAPABILITY_REPLY = "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.";
-const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V2";
+const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V3_GENUINE_VIDEO";
 const TOLA_BEHAVIOR_CONTRACT = [
   `TOLA BEHAVIOR CONTRACT ${TOLA_BEHAVIOR_CONTRACT_REVISION}. This contract applies to every WhatsApp response and takes priority over generic assistant behavior.`,
   "TOLA is a human-facing execution agent, not a generic chatbot. Speak as TOLA and return only the direct WhatsApp reply.",
@@ -57,7 +59,8 @@ const TOLA_BEHAVIOR_CONTRACT = [
   "Ask one short question only when information, identity, consent, payment, authentication, rights, legal approval, material authority, or another genuine dependency is missing.",
   "Use short WhatsApp-native language: direct acknowledgment, action, result, and at most one necessary question. Do not use email formatting, long signatures, or infrastructure explanations.",
   "Never claim a consequential external action occurred unless verified evidence in the current request proves it occurred.",
-  "For a clear request to create an image or video, invoke the available private creation capability. Never answer with a prompt, storyboard, plan, or a claim that you cannot create it.",
+  "For a clear image request, invoke the available image creation capability. For a clear video request, invoke only a bound genuine temporal video-generation capability; never substitute an animated still, pan, zoom, slideshow, repeated frame, or image wrapped in MP4.",
+  "If genuine video generation is not currently bound or authorized, return the exact missing provider or authority as a blocker. Never claim video completion merely because an MP4 exists.",
 ].join("\n");
 
 const now = () => new Date().toISOString();
@@ -180,9 +183,13 @@ function validGeneratedImage(bytes) {
 
 function capabilityFailureReply(error) {
   const code = safeError(error);
+  if (/TOLA_GENUINE_VIDEO_PROVIDER_UNBOUND/i.test(code)) return "Real video generation isn’t connected yet. The smallest unblock is a server-side FAL_KEY for the existing Kling video route; I won’t fake it with an animated still.";
+  if (/TOLA_GENUINE_VIDEO_AUTHORITY_UNBOUND/i.test(code)) return "Real video generation is connected but not authorized for metered use. Enable the existing private video-generation authority; I won’t spend or fake a result without it.";
+  if (/TOLA_VIDEO_(?:TEMPORAL|PLAYBACK|CONTAINER|STREAM|ARTIFACT|DOWNLOAD)/i.test(code)) return "A real video was generated, but it failed video or motion validation, so I didn’t send or claim it as complete.";
+  if (/TOLA_VIDEO_PROVIDER_GENERATION/i.test(code)) return "The genuine video provider failed to return a valid moving video. No still-image substitute was created or sent.";
   if (/OPENAI_IMAGE_403|VERIFICATION/i.test(code)) return "Image creation is blocked for this OpenAI project until image-model access is enabled. That is the only missing capability.";
   if (/OPENAI_IMAGE_429|RATE/i.test(code)) return "Image creation is temporarily rate-limited. The WANT is preserved; retrying the request is the only remaining step.";
-  if (/FFMPEG|RENDERED_VIDEO|VIDEO_SOURCE/i.test(code)) return "The visual was created, but the video render failed. The cloud video renderer is the exact blocked step.";
+  if (/FFMPEG/i.test(code)) return "A genuine video was generated, but WhatsApp-compatible video validation failed. No unverified file was sent.";
   if (/WHATSAPP_MEDIA_UPLOAD|WHATSAPP_SEND/i.test(code)) return "The result was created, but WhatsApp media delivery failed. The WANT and finished artifact are preserved.";
   return "The creation route hit a verified runtime failure. The WANT is preserved; no completion was claimed.";
 }
@@ -399,7 +406,7 @@ class CloudStore {
 }
 
 class TolaCloudRuntime {
-  constructor({ app, env = process.env, fetchImpl = globalThis.fetch } = {}) {
+  constructor({ app, env = process.env, fetchImpl = globalThis.fetch, videoClient = null } = {}) {
     this.app = app;
     this.env = env;
     this.fetch = fetchImpl;
@@ -410,6 +417,11 @@ class TolaCloudRuntime {
     this.localNodeToken = env.TOLA_LOCAL_NODE_TOKEN || "";
     this.model = env.OPENAI_COMMAND_TOWER_MODEL || "gpt-5.4-mini";
     this.imageModel = env.OPENAI_IMAGE_MODEL || "gpt-image-2.5-flare";
+    this.videoModel = env.TOLA_VIDEO_MODEL || DEFAULT_VIDEO_MODEL;
+    this.imageToVideoModel = env.TOLA_IMAGE_TO_VIDEO_MODEL || "fal-ai/kling-video/v2.6/pro/image-to-video";
+    this.videoKey = env.FAL_KEY || "";
+    this.videoGenerationAuthorized = /^(?:1|true|yes|on)$/i.test(String(env.TOLA_VIDEO_GENERATION_AUTHORIZED || ""));
+    this.videoClient = videoClient || (this.videoKey ? createFalClient({ credentials: this.videoKey }) : null);
     this.canonRevision = env.CANON_REVISION || "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358";
     this.stateDir = env.TOLA_STATE_DIR || "/tmp/chairman-cloud-state";
     this.store = new CloudStore(this.stateDir);
@@ -418,6 +430,26 @@ class TolaCloudRuntime {
     this.lastPollAt = null;
     this.lastError = null;
     this.transientMedia = new Map();
+  }
+
+  videoAvailability() {
+    if (!this.videoKey && !this.videoClient) {
+      return {
+        available: false,
+        provider: "fal",
+        model: this.videoModel,
+        blocker: "TOLA_GENUINE_VIDEO_PROVIDER_UNBOUND:FAL_KEY",
+      };
+    }
+    if (!this.videoGenerationAuthorized) {
+      return {
+        available: false,
+        provider: "fal",
+        model: this.videoModel,
+        blocker: "TOLA_GENUINE_VIDEO_AUTHORITY_UNBOUND:TOLA_VIDEO_GENERATION_AUTHORIZED",
+      };
+    }
+    return { available: true, provider: "fal", model: this.videoModel, image_to_video_model: this.imageToVideoModel, blocker: null };
   }
 
   assertConfig() {
@@ -439,6 +471,7 @@ class TolaCloudRuntime {
         last_poll_at: this.lastPollAt,
         tola_contract_revision: TOLA_BEHAVIOR_CONTRACT_REVISION,
         private_media_execution: true,
+        genuine_video_generation: this.videoAvailability(),
         quoted_reply_context: false,
       });
     });
@@ -839,7 +872,7 @@ class TolaCloudRuntime {
   }
 
   async confirmPrivateMediaExecution(plan, envelope, previousResponseId = null) {
-    const inputText = `Privately execute this media WANT now. Confirm the current image is available as the render source.\n${plan.prompt}`;
+    const inputText = `Privately execute this ${plan.type} WANT now. Confirm the WANT and any supplied source media are usable.\n${plan.prompt}`;
     const input = plan.source_image
       ? [{ role: "user", content: [
           { type: "input_text", text: inputText },
@@ -849,7 +882,7 @@ class TolaCloudRuntime {
     const request = {
       model: this.model,
       store: true,
-      instructions: "You are the private execution controller. Verify the supplied source is usable and reply with only EXECUTE. Do not address the customer.",
+      instructions: "You are the private execution controller. Verify the requested private artifact and any supplied source are usable. Reply with only EXECUTE. Do not address the customer.",
       input,
       metadata: {
         a2a_id: envelope.A2A_ID,
@@ -871,58 +904,204 @@ class TolaCloudRuntime {
     return { openai_response_id: body.id, request_sha256: sha256(request) };
   }
 
-  async renderPrivateVideo(image, source) {
-    if (!Buffer.isBuffer(image?.bytes) || !validGeneratedImage(image.bytes)) throw new Error("TOLA_VIDEO_SOURCE_IMAGE_INVALID");
+  async downloadGeneratedVideo(file) {
+    if (String(file?.content_type || "").toLowerCase() !== "video/mp4") throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_CONTENT_TYPE_INVALID");
+    const declaredSize = Number(file?.file_size);
+    if (Number.isFinite(declaredSize) && (declaredSize <= 0 || declaredSize > MEDIA_LIMITS.video)) throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_SIZE_INVALID");
+    let url;
+    try { url = new URL(file?.url); }
+    catch { throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_URL_INVALID"); }
+    if (url.protocol !== "https:" || url.username || url.password || !(url.hostname === "fal.media" || url.hostname.endsWith(".fal.media"))) {
+      throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_URL_DENIED");
+    }
+    const response = await this.fetch(url, { redirect: "manual", signal: AbortSignal.timeout(180000) });
+    if (response.status >= 300 && response.status < 400) throw new Error("TOLA_VIDEO_DOWNLOAD_REDIRECT_DENIED");
+    if (!response.ok || !response.body?.getReader) throw new Error(`TOLA_VIDEO_DOWNLOAD_${response.status || "FAILED"}`);
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        received += chunk.length;
+        if (received > MEDIA_LIMITS.video || (Number.isFinite(declaredSize) && received > declaredSize)) {
+          await reader.cancel().catch(() => {});
+          throw new Error("TOLA_VIDEO_DOWNLOAD_SIZE_EXCEEDED");
+        }
+        chunks.push(chunk);
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+    if (!received || (Number.isFinite(declaredSize) && received !== declaredSize)) throw new Error("TOLA_VIDEO_DOWNLOAD_SIZE_MISMATCH");
+    return Buffer.concat(chunks, received);
+  }
+
+  async probeVideo(file) {
+    let stdout;
+    try {
+      ({ stdout } = await execFileAsync(this.env.FFPROBE_PATH || "/usr/bin/ffprobe", [
+        "-v", "error",
+        "-show_entries", "format=format_name,duration:stream=codec_type,codec_name,width,height,avg_frame_rate,duration,nb_frames",
+        "-of", "json",
+        file,
+      ], { timeout: 60000, maxBuffer: 1024 * 1024 }));
+    } catch { throw new Error("TOLA_VIDEO_STREAM_PROBE_FAILED"); }
+    const probe = parse(String(stdout), null);
+    const stream = probe?.streams?.find(item => item.codec_type === "video");
+    const duration = Number(stream?.duration || probe?.format?.duration);
+    const width = Number(stream?.width);
+    const height = Number(stream?.height);
+    if (!String(probe?.format?.format_name || "").split(",").some(name => ["mp4", "mov"].includes(name))) throw new Error("TOLA_VIDEO_CONTAINER_INVALID");
+    if (!stream || !Number.isFinite(duration) || duration <= 0 || !Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0) {
+      throw new Error("TOLA_VIDEO_STREAM_INVALID");
+    }
+    return { duration_seconds: duration, width, height, codec: String(stream.codec_name || "").toLowerCase(), avg_frame_rate: stream.avg_frame_rate || null, frame_count: Number(stream.nb_frames) || null };
+  }
+
+  async temporalVideoValidation(file) {
+    let stdout;
+    try {
+      ({ stdout } = await execFileAsync(this.env.FFMPEG_PATH || "/usr/bin/ffmpeg", [
+        "-hide_banner", "-loglevel", "error", "-i", file,
+        "-vf", "fps=2,scale=64:64:force_original_aspect_ratio=decrease,pad=64:64:(ow-iw)/2:(oh-ih)/2,format=gray",
+        "-frames:v", "12", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+      ], { encoding: "buffer", timeout: 120000, maxBuffer: 2 * 1024 * 1024 }));
+    } catch { throw new Error("TOLA_VIDEO_TEMPORAL_SAMPLE_FAILED"); }
+    const bytes = Buffer.from(stdout || []);
+    const frameSize = 64 * 64;
+    const sampleCount = Math.floor(bytes.length / frameSize);
+    if (sampleCount < 3 || bytes.length % frameSize !== 0) throw new Error("TOLA_VIDEO_TEMPORAL_SAMPLE_INSUFFICIENT");
+    let totalDifference = 0;
+    let changedPixels = 0;
+    const comparisons = sampleCount - 1;
+    for (let frame = 1; frame < sampleCount; frame += 1) {
+      const prior = (frame - 1) * frameSize;
+      const current = frame * frameSize;
+      for (let pixel = 0; pixel < frameSize; pixel += 1) {
+        const difference = Math.abs(bytes[current + pixel] - bytes[prior + pixel]);
+        totalDifference += difference;
+        if (difference >= 12) changedPixels += 1;
+      }
+    }
+    bytes.fill(0);
+    const meanAbsoluteDifference = totalDifference / (comparisons * frameSize);
+    const changedPixelRatio = changedPixels / (comparisons * frameSize);
+    const passed = meanAbsoluteDifference >= 1 && changedPixelRatio >= 0.02;
+    if (!passed) throw new Error("TOLA_VIDEO_TEMPORAL_VARIATION_FAILED");
+    return {
+      passed: true,
+      sampled_frames: sampleCount,
+      mean_absolute_difference: Number(meanAbsoluteDifference.toFixed(4)),
+      changed_pixel_ratio: Number(changedPixelRatio.toFixed(6)),
+      local_motion_synthesis: false,
+      repeated_still_rejected: true,
+    };
+  }
+
+  async validateAndPersistGenuineVideo(bytes, source) {
+    if (!Buffer.isBuffer(bytes) || bytes.length < 64 || bytes.length > MEDIA_LIMITS.video) throw new Error("TOLA_VIDEO_ARTIFACT_INVALID");
     const artifactDir = path.join(this.stateDir, "deliverables", "tola");
     fs.mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
     const artifactId = shortHash(`${PRIVATE_MEDIA_CAPABILITY_VERSION}:${source.idempotency_key}`);
     const artifactFile = path.join(artifactDir, `${artifactId}.mp4`);
-    const validate = () => {
-      const bytes = fs.readFileSync(artifactFile);
-      if (!bytes.subarray(0, Math.min(64, bytes.length)).includes(Buffer.from("ftyp")) || bytes.length <= 0 || bytes.length > WHATSAPP_OUTBOUND_MEDIA_LIMIT) {
-        throw new Error("TOLA_RENDERED_VIDEO_INVALID");
+    const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-genuine-video-"));
+    const inputFile = path.join(temporaryDir, "provider.mp4");
+    const outputFile = path.join(temporaryDir, "whatsapp.mp4");
+    try {
+      fs.writeFileSync(inputFile, bytes, { mode: 0o600 });
+      const sourceProbe = await this.probeVideo(inputFile);
+      if (sourceProbe.codec === "h264" && bytes.length <= WHATSAPP_OUTBOUND_MEDIA_LIMIT) {
+        fs.copyFileSync(inputFile, outputFile);
+      } else {
+        try {
+          await execFileAsync(this.env.FFMPEG_PATH || "/usr/bin/ffmpeg", [
+            "-hide_banner", "-loglevel", "error", "-y", "-i", inputFile,
+            "-map", "0:v:0", "-map", "0:a?",
+            "-vf", "scale='min(720,iw)':-2",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "28", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", outputFile,
+          ], { timeout: 300000, maxBuffer: 2 * 1024 * 1024 });
+        } catch { throw new Error("TOLA_VIDEO_WHATSAPP_TRANSCODE_FAILED"); }
       }
+      const validatedBytes = fs.readFileSync(outputFile);
+      if (!validatedBytes.length || validatedBytes.length > WHATSAPP_OUTBOUND_MEDIA_LIMIT || !validatedBytes.subarray(0, Math.min(64, validatedBytes.length)).includes(Buffer.from("ftyp"))) {
+        throw new Error("TOLA_VIDEO_ARTIFACT_WHATSAPP_INVALID");
+      }
+      const probe = await this.probeVideo(outputFile);
+      if (probe.codec !== "h264") throw new Error("TOLA_VIDEO_STREAM_CODEC_NOT_H264");
+      try {
+        await execFileAsync(this.env.FFMPEG_PATH || "/usr/bin/ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", outputFile, "-f", "null", "-"], { timeout: 180000, maxBuffer: 2 * 1024 * 1024 });
+      } catch { throw new Error("TOLA_VIDEO_PLAYBACK_DECODE_FAILED"); }
+      const frame_difference = await this.temporalVideoValidation(outputFile);
+      if (!fs.existsSync(artifactFile)) fs.copyFileSync(outputFile, artifactFile, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(artifactFile, 0o600);
+      const persisted = fs.readFileSync(artifactFile);
       return {
-        bytes,
+        bytes: persisted,
         artifact_ref: `deliverable:${artifactId}`,
+        artifact_path: artifactFile,
         mime_type: "video/mp4",
         filename: "tola-created-video.mp4",
-        sha256: sha256(bytes),
-        size_bytes: bytes.length,
-        duration_seconds: 6,
-        width: 720,
-        height: 1280,
-        codec: "H.264",
-        audio: false,
+        sha256: sha256(persisted),
+        size_bytes: persisted.length,
+        ...probe,
+        resolution: `${probe.width}x${probe.height}`,
+        codec: "h264",
+        frame_difference,
+        provider_generated_frames: true,
+        local_motion_synthesis: false,
       };
-    };
-    if (fs.existsSync(artifactFile)) return validate();
-    const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-video-"));
-    const inputFile = path.join(temporaryDir, "source-image");
-    const outputFile = path.join(temporaryDir, "result.mp4");
-    fs.writeFileSync(inputFile, image.bytes, { mode: 0o600 });
-    const filter = [
-      "scale=720:1280:force_original_aspect_ratio=increase",
-      "crop=720:1280",
-      "zoompan=z='1+0.035*on/179':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=180:s=720x1280:fps=30",
-      "fade=t=in:st=0:d=0.35",
-      "fade=t=out:st=5.5:d=0.5",
-      "format=yuv420p",
-    ].join(",");
-    try {
-      await execFileAsync(this.env.FFMPEG_PATH || "/usr/bin/ffmpeg", [
-        "-hide_banner", "-loglevel", "error", "-y",
-        "-loop", "1", "-i", inputFile,
-        "-vf", filter,
-        "-t", "6", "-r", "30", "-an", "-threads", "1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart", outputFile,
-      ], { timeout: 180000, maxBuffer: 1024 * 1024 });
-      fs.copyFileSync(outputFile, artifactFile, fs.constants.COPYFILE_EXCL);
-      fs.chmodSync(artifactFile, 0o600);
-      return validate();
     } finally {
       fs.rmSync(temporaryDir, { recursive: true, force: true });
+    }
+  }
+
+  async generateGenuineVideo(plan, envelope, source) {
+    const availability = this.videoAvailability();
+    if (!availability.available) throw new Error(availability.blocker);
+    const model = plan.source_image ? this.imageToVideoModel : this.videoModel;
+    const prompt = [
+      "Generate a genuine temporally coherent moving scene for this private WANT.",
+      "Subject motion must be visible across time. Do not produce a static still, repeated frame, slideshow, Ken Burns effect, or camera-only pan/zoom.",
+      plan.prompt,
+    ].join("\n\n").slice(0, 12000);
+    const input = {
+      prompt,
+      duration: "5",
+      negative_prompt: "static still image, repeated frame, slideshow, Ken Burns effect, camera-only pan, camera-only zoom, watermark, blur, distorted anatomy, low quality",
+      generate_audio: false,
+    };
+    if (plan.source_image) input.start_image_url = `data:${plan.source_image.mime_type};base64,${plan.source_image.bytes.toString("base64")}`;
+    else input.aspect_ratio = "9:16";
+    let generationId = null;
+    let generated;
+    try {
+      generated = await this.videoClient.subscribe(model, {
+        input,
+        logs: false,
+        onEnqueue: requestId => { generationId = requestId; },
+        abortSignal: AbortSignal.timeout(12 * 60 * 1000),
+      });
+    } catch {
+      throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_FAILED");
+    }
+    generationId = String(generated?.requestId || generationId || "");
+    if (!generationId || !generated?.data?.video) throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_RESULT_INVALID");
+    const providerBytes = await this.downloadGeneratedVideo(generated.data.video);
+    try {
+      const artifact = await this.validateAndPersistGenuineVideo(providerBytes, source);
+      return {
+        artifact,
+        generation_id: generationId,
+        provider: "fal",
+        model,
+        request_sha256: sha256({ model, input: { ...input, ...(input.start_image_url ? { start_image_url: `data:${plan.source_image.mime_type};sha256,${plan.source_image.sha256}` } : {}) }, A2A_ID: envelope.A2A_ID }),
+      };
+    } finally {
+      providerBytes.fill(0);
     }
   }
 
@@ -957,22 +1136,23 @@ class TolaCloudRuntime {
     if (!claim.execute) throw new Error(`TOLA_PRIVATE_MEDIA_ACTION_${claim.reason}`);
     try {
     const previousResponseId = this.priorResponse(envelope.TRANSACTION_ID, "");
-    const generated = plan.source_image && plan.type === "video"
-      ? (() => ({
-          bytes: Buffer.from(plan.source_image.bytes),
-          mime_type: plan.source_image.mime_type,
-          filename: plan.source_image.filename,
-          source_media_sha256: plan.source_image.sha256,
-        }))()
-      : await this.generatePrivateImage(plan, envelope, previousResponseId);
-    if (!generated.openai_response_id) {
+    let generated;
+    let generation = null;
+    let artifact;
+    if (plan.type === "video") {
+      const availability = this.videoAvailability();
+      if (!availability.available) throw new Error(availability.blocker);
       const confirmation = await this.confirmPrivateMediaExecution(plan, envelope, previousResponseId);
-      generated.openai_response_id = confirmation.openai_response_id;
-      generated.request_sha256 = confirmation.request_sha256;
-    }
-    const artifact = plan.type === "video"
-      ? await this.renderPrivateVideo(generated, source)
-      : (() => {
+      generation = await this.generateGenuineVideo(plan, envelope, source);
+      generated = {
+        openai_response_id: confirmation.openai_response_id,
+        request_sha256: confirmation.request_sha256,
+        source_media_sha256: plan.source_image?.sha256 || null,
+      };
+      artifact = generation.artifact;
+    } else {
+      generated = await this.generatePrivateImage(plan, envelope, previousResponseId);
+      artifact = (() => {
           const artifactDir = path.join(this.stateDir, "deliverables", "tola");
           fs.mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
           const artifactId = shortHash(`${PRIVATE_MEDIA_CAPABILITY_VERSION}:${source.idempotency_key}`);
@@ -981,6 +1161,7 @@ class TolaCloudRuntime {
           const bytes = fs.readFileSync(file);
           return { bytes, artifact_ref: `deliverable:${artifactId}`, mime_type: "image/jpeg", filename: "tola-created-image.jpg", sha256: sha256(bytes), size_bytes: bytes.length };
         })();
+    }
     const result = {
       status: "PRIVATE_MEDIA_CREATED",
       capability: PRIVATE_MEDIA_CAPABILITY_VERSION,
@@ -990,6 +1171,13 @@ class TolaCloudRuntime {
       size_bytes: artifact.size_bytes,
       mime_type: artifact.mime_type,
       openai_response_id: generated.openai_response_id,
+      generation_id: generation?.generation_id || null,
+      generation_provider: generation?.provider || null,
+      generation_model: generation?.model || null,
+      video_validation: artifact.frame_difference || null,
+      duration_seconds: artifact.duration_seconds || null,
+      resolution: artifact.resolution || null,
+      codec: artifact.codec || null,
       execution_count: 1,
       terminal_state: "EXECUTED",
     };
@@ -1003,6 +1191,16 @@ class TolaCloudRuntime {
       source_media_sha256: generated.source_media_sha256 || null,
       openai_response_id: generated.openai_response_id,
       request_sha256: generated.request_sha256,
+      generation_request_sha256: generation?.request_sha256 || null,
+      generation_id: generation?.generation_id || null,
+      generation_provider: generation?.provider || null,
+      generation_model: generation?.model || null,
+      duration_seconds: artifact.duration_seconds || null,
+      resolution: artifact.resolution || null,
+      codec: artifact.codec || null,
+      frame_difference: artifact.frame_difference || null,
+      provider_generated_frames: artifact.provider_generated_frames || false,
+      local_motion_synthesis: artifact.local_motion_synthesis || false,
       authority_scope: PRIVATE_MEDIA_SCOPE,
       at: now(),
     }];
@@ -1031,6 +1229,9 @@ class TolaCloudRuntime {
       execution_receipt_id: executionKey,
       artifact,
       openai_response_id: generated.openai_response_id,
+      generation_id: generation?.generation_id || null,
+      generation_provider: generation?.provider || null,
+      generation_model: generation?.model || null,
       reply: plan.type === "video" ? "Done — I created the video." : "Done — I created the image.",
       evidence,
     };
@@ -1070,7 +1271,8 @@ class TolaCloudRuntime {
       payload: source.intent,
       capability_truth: {
         cloud_reasoning: true, whatsapp_private_reply: true,
-        private_image_creation: true, private_video_creation: true,
+        private_image_creation: true,
+        private_video_creation: this.videoAvailability(),
         chairman_local: this.store.availability("CHAIRMAN_LOCAL").state,
         consequential_actions: "EXACT_AUTHORITY_AND_PAI_REQUIRED",
       },
@@ -1279,6 +1481,9 @@ class TolaCloudRuntime {
         next_action: "TOLA_DELIVER_PRIVATE_MEDIA_TO_ORIGINAL_WHATSAPP_THREAD",
         capability_execution_job_id: privateMedia.execution_job_id,
         capability_receipt_id: privateMedia.execution_receipt_id,
+        generation_id: privateMedia.generation_id,
+        generation_provider: privateMedia.generation_provider,
+        generation_model: privateMedia.generation_model,
         receipt: { idempotency_key: envelope.idempotency_key, status: "COMPLETED", execution_count: 1, completed_at: now() },
         terminal_state: "EXECUTED",
         terminal_evidence: { executor_invoked: "OPENAI_COMMAND_TOWER_RUNTIME", authority_result: "EXACT_PRIVATE_CREATION_AUTHORIZED", external_action_performed: `PRIVATE_${privateMedia.plan.type.toUpperCase()}_CREATED`, downstream_effects_authorized: true },
@@ -1334,10 +1539,10 @@ class TolaCloudRuntime {
     } else {
       sent = await this.sendReply(reference, reply);
     }
-    const sendResult = { status: "WHATSAPP_REPLY_ACCEPTED", inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id, channel_thread_id: reference.thread_id, A2A_ID: a2aId, OPPORTUNITY_ID: opportunityId, WANT_ID: wantId, job_id: source.job_id, reasoning_job_id: reasoning.job_id, openai_response_id: outcome.result.openai_response_id, reasoning_result_ref: outcome.result.reasoning_result_ref, receipt_id: sendKey, delivery_state: "accepted", duplicate_execution: false, duplicate_reply: false, chairman_availability: this.store.availability("CHAIRMAN_LOCAL").state, ...(privateMedia ? { capability_execution_job_id: privateMedia.execution_job_id, capability_receipt_id: privateMedia.execution_receipt_id, media_delivery: { type: privateMedia.plan.type, mime_type: privateMedia.artifact.mime_type, size_bytes: privateMedia.artifact.size_bytes, sha256: privateMedia.artifact.sha256, provider_media_id_persisted: false } } : {}) };
+    const sendResult = { status: "WHATSAPP_REPLY_ACCEPTED", inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id, channel_thread_id: reference.thread_id, A2A_ID: a2aId, OPPORTUNITY_ID: opportunityId, WANT_ID: wantId, job_id: source.job_id, reasoning_job_id: reasoning.job_id, openai_response_id: outcome.result.openai_response_id, reasoning_result_ref: outcome.result.reasoning_result_ref, receipt_id: sendKey, delivery_state: "accepted", duplicate_execution: false, duplicate_reply: false, chairman_availability: this.store.availability("CHAIRMAN_LOCAL").state, ...(privateMedia ? { capability_execution_job_id: privateMedia.execution_job_id, capability_receipt_id: privateMedia.execution_receipt_id, media_delivery: { type: privateMedia.plan.type, mime_type: privateMedia.artifact.mime_type, size_bytes: privateMedia.artifact.size_bytes, sha256: privateMedia.artifact.sha256, artifact_ref: privateMedia.artifact.artifact_ref, generation_id: outcome.result.generation_id || null, generation_provider: outcome.result.generation_provider || null, generation_model: outcome.result.generation_model || null, duration_seconds: privateMedia.artifact.duration_seconds || null, resolution: privateMedia.artifact.resolution || null, codec: privateMedia.artifact.codec || null, frame_difference: privateMedia.artifact.frame_difference || null, provider_generated_frames: privateMedia.artifact.provider_generated_frames || false, local_motion_synthesis: privateMedia.artifact.local_motion_synthesis || false, provider_media_id_persisted: false } } : {}) };
     const sendEvidence = [
       ...(privateMedia ? [
-        { type: "TOLA_PRIVATE_MEDIA_DELIVERED", verified: true, media_type: privateMedia.plan.type, artifact_sha256: privateMedia.artifact.sha256, size_bytes: privateMedia.artifact.size_bytes, mime_type: privateMedia.artifact.mime_type, provider_media_id_persisted: false },
+        { type: "TOLA_PRIVATE_MEDIA_DELIVERED", verified: true, media_type: privateMedia.plan.type, artifact_sha256: privateMedia.artifact.sha256, size_bytes: privateMedia.artifact.size_bytes, mime_type: privateMedia.artifact.mime_type, generation_id: outcome.result.generation_id || null, duration_seconds: privateMedia.artifact.duration_seconds || null, resolution: privateMedia.artifact.resolution || null, codec: privateMedia.artifact.codec || null, frame_difference: privateMedia.artifact.frame_difference || null, provider_generated_frames: privateMedia.artifact.provider_generated_frames || false, local_motion_synthesis: privateMedia.artifact.local_motion_synthesis || false, provider_media_id_persisted: false },
         { type: "TOLA_WHATSAPP_MEDIA_UPLOADED", verified: true, media_type: privateMedia.plan.type, artifact_sha256: privateMedia.artifact.sha256, provider_media_id_persisted: false },
       ] : []),
       { type: "TOLA_WHATSAPP_SEND_ACCEPTED", verified: true, inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id, same_thread: sent.recipient_id === reference.participant_id, quoted_message: false, at: now() },
