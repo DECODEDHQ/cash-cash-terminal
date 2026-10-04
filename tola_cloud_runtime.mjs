@@ -371,7 +371,23 @@ class TolaCloudRuntime {
       const envelope = job.constraints?.a2a_envelope || {};
       const source = this.store.get(envelope.payload_ref?.job_id);
       const outbound = source ? this.store.receipt(source.result?.outbound_receipt_id || `whatsapp:send:${source.constraints?.whatsapp_reference?.agent_id}:${shortHash(source.constraints?.whatsapp_reference?.action_id || "")}`) : null;
-      response.json({ ok: true, job, source, outbound, events: this.store.db.prepare("SELECT * FROM job_events WHERE job_id IN (?,?) ORDER BY event_id").all(job.job_id, source?.job_id || "") });
+      const receiptCounts = {
+        source_job: source ? Number(this.store.db.prepare("SELECT COUNT(*) count FROM action_receipts WHERE job_id=?").get(source.job_id)?.count || 0) : 0,
+        reasoning_job: Number(this.store.db.prepare("SELECT COUNT(*) count FROM action_receipts WHERE job_id=?").get(job.job_id)?.count || 0),
+      };
+      receiptCounts.total = receiptCounts.source_job + receiptCounts.reasoning_job;
+      const effects = fs.existsSync(this.store.effectsFile)
+        ? fs.readFileSync(this.store.effectsFile, "utf8").split(/\r?\n/).filter(Boolean).map(line => parse(line, null)).filter(event => event && [job.job_id, source?.job_id].includes(event.job_id))
+        : [];
+      response.json({
+        ok: true,
+        job,
+        source,
+        outbound,
+        receipt_counts: receiptCounts,
+        effects,
+        events: this.store.db.prepare("SELECT * FROM job_events WHERE job_id IN (?,?) ORDER BY event_id").all(job.job_id, source?.job_id || ""),
+      });
     });
 
     this.app.get("/tola-cloud/admin/recent", (request, response) => {
