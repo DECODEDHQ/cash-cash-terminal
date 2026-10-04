@@ -47,7 +47,13 @@ const PRIVATE_MEDIA_SCOPE = "PRIVATE_ARTIFACT_CREATE";
 const DEFAULT_VIDEO_PRODUCT = "Meta Muse Video";
 const DEFAULT_REPLY = "Tell me what you want. I’ll work out the rest.";
 const CAPABILITY_REPLY = "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.";
-const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V6_LIVE_MUSE_REGISTRY";
+const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V7_REAL_REN_HANDOFF";
+const REN_TRANSPORT_PROTOCOL = "TOLA_REN_ENCRYPTED_PULL_V1";
+const REN_X25519_PUBLIC_DER_B64 = "MCowBQYDK2VuAyEAUXpJGrRqRDD40S5Hg17uNpdrpfw1PSiRUvCUB20p+Fg=";
+const REN_ED25519_PUBLIC_DER_B64 = "MCowBQYDK2VwAyEAz7I+wE4qJIFMLO5RW+3d1UOFNOcp0QkLULYcFWwKfB8=";
+const REN_X25519_FINGERPRINT = "75143830bf819b9cfba13e6e31947899a5c1fc9c1aa5251ed5f87a5ac5bde46a";
+const REN_ED25519_FINGERPRINT = "0e7a294dde0a7582fd2528f29165c45dc6ffa07718dcb8910ba34915779ef56d";
+const REN_RESULT_STATES = new Set(["COMPLETED", "BLOCKED"]);
 const TOLA_BEHAVIOR_CONTRACT = [
   `TOLA BEHAVIOR CONTRACT ${TOLA_BEHAVIOR_CONTRACT_REVISION}. This contract applies to every WhatsApp response and takes priority over generic assistant behavior.`,
   "TOLA is a human-facing execution agent, not a generic chatbot. Speak as TOLA and return only the direct WhatsApp reply.",
@@ -62,6 +68,8 @@ const TOLA_BEHAVIOR_CONTRACT = [
   "For a clear image request, invoke the available image creation capability. For a clear video request, invoke only a bound genuine temporal video-generation capability; never substitute an animated still, pan, zoom, slideshow, repeated frame, or image wrapped in MP4.",
   "If genuine video generation is not currently available, state only the human-relevant capability or permission blocker. Never expose provider names, model names, environment variables, credentials, internal codes, or infrastructure details.",
   "Never claim video completion merely because an MP4 exists.",
+  "For work that requires estate execution, preserve the requester and authority exactly and hand the WANT to the real MUSE_REN runtime. Never treat a foundation-model response as REN execution evidence.",
+  "Acceptance, execution completion, and result delivery are separate states. Acknowledgment is not proof that work completed.",
 ].join("\n");
 
 const now = () => new Date().toISOString();
@@ -170,6 +178,36 @@ function explicitMediaWant(value) {
   if (/\b(?:video|promo|reel|clip|animation)\b/i.test(text)) return "video";
   if (/\b(?:image|picture|photo|graphic|poster|artwork)\b/i.test(text)) return "image";
   return null;
+}
+
+function isRenExecutionWant(value) {
+  const text = String(value || "").trim();
+  if (!text || isOpening(text) || isCapabilityQuestion(text) || explicitMediaWant(text)) return false;
+  if (/\b(?:what|who|when|where|why|how)\b.*\b(?:is|are|was|were|does|do|did)\b/i.test(text)) return false;
+  return /\b(?:book|buy|purchase|reserve|schedule|send|email|message|contact|call|publish|post|upload|deploy|build|implement|repair|fix|coordinate|organize|arrange|follow[ -]?up|apply|submit|file|negotiate|source|procure|fulfil|fulfill|execute|complete|handle|investigate|research and (?:deliver|save|prepare|complete)|prepare (?:and|the)|create (?:a |an |the )?(?:report|proposal|document|spreadsheet|plan|campaign|listing|booking|application)|do (?:this|that|it|something))\b/i.test(text);
+}
+
+function exportPublicDer(key) {
+  return key.export({ type: "spki", format: "der" });
+}
+
+function loadOrCreateKeyPair(directory, name, type) {
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const privateFile = path.join(directory, `${name}-private.pem`);
+  let privateKey;
+  if (fs.existsSync(privateFile)) {
+    privateKey = crypto.createPrivateKey(fs.readFileSync(privateFile));
+  } else {
+    const pair = crypto.generateKeyPairSync(type);
+    privateKey = pair.privateKey;
+    fs.writeFileSync(privateFile, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600, flag: "wx" });
+  }
+  fs.chmodSync(privateFile, 0o600);
+  return { privateKey, publicKey: crypto.createPublicKey(privateKey), privateFile };
+}
+
+function transportKey(sharedSecret, context) {
+  return Buffer.from(crypto.hkdfSync("sha256", sharedSecret, Buffer.from(sha256(context), "hex"), Buffer.from(REN_TRANSPORT_PROTOCOL), 32));
 }
 
 function isMediaContinuation(value) {
@@ -362,6 +400,30 @@ class CloudStore {
     }
   }
 
+  retryFailedAction(jobId, key) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const prior = this.db.prepare("SELECT * FROM action_receipts WHERE idempotency_key=?").get(key);
+      if (!prior) {
+        this.db.prepare("INSERT INTO action_receipts VALUES(?,?,?,?,?,?,NULL)")
+          .run(key, jobId, "STARTED", "[]", null, now());
+        this.db.exec("COMMIT");
+        return { execute: true, reason: "CLAIMED" };
+      }
+      if (prior.status !== "FAILED") {
+        this.db.exec("COMMIT");
+        return { execute: false, reason: prior.status, receipt: { ...prior, evidence: parse(prior.evidence, []), result: parse(prior.result) } };
+      }
+      this.db.prepare("UPDATE action_receipts SET status='STARTED',result=NULL,evidence='[]',completed_at=NULL WHERE idempotency_key=? AND job_id=?")
+        .run(key, jobId);
+      this.db.exec("COMMIT");
+      return { execute: true, reason: "RETRY_CLAIMED" };
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
   finishAction(jobId, key, result, evidence = []) {
     this.db.prepare("UPDATE action_receipts SET status='COMPLETED',result=?,evidence=?,completed_at=? WHERE idempotency_key=? AND job_id=?")
       .run(JSON.stringify(result), JSON.stringify(evidence), now(), key, jobId);
@@ -410,6 +472,17 @@ class CloudStore {
     return event;
   }
 
+  appendEffectOnce(effectId, type, data) {
+    if (fs.existsSync(this.effectsFile)) {
+      const exists = fs.readFileSync(this.effectsFile, "utf8")
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .some(line => parse(line, {})?.effect_id === effectId);
+      if (exists) return null;
+    }
+    return this.appendEffect(type, { effect_id: effectId, ...data });
+  }
+
   cursor() {
     try { return JSON.parse(fs.readFileSync(this.cursorFile, "utf8")); }
     catch { return { next_offset: null, agent_id: null, updated_at: null }; }
@@ -419,7 +492,7 @@ class CloudStore {
 }
 
 class TolaCloudRuntime {
-  constructor({ app, env = process.env, fetchImpl = globalThis.fetch, videoClient = null } = {}) {
+  constructor({ app, env = process.env, fetchImpl = globalThis.fetch, videoClient = null, renAdapter = null, renPublicKeys = null } = {}) {
     this.app = app;
     this.env = env;
     this.fetch = fetchImpl;
@@ -440,6 +513,25 @@ class TolaCloudRuntime {
     this.canonRevision = env.CANON_REVISION || "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358";
     this.stateDir = env.TOLA_STATE_DIR || "/tmp/chairman-cloud-state";
     this.store = new CloudStore(this.stateDir);
+    this.renAdapter = renAdapter;
+    const transportDir = path.join(this.stateDir, "transport");
+    this.tolaTransport = {
+      x25519: loadOrCreateKeyPair(transportDir, "tola-x25519", "x25519"),
+      ed25519: loadOrCreateKeyPair(transportDir, "tola-ed25519", "ed25519"),
+    };
+    const configuredRen = renPublicKeys || {
+      x25519: REN_X25519_PUBLIC_DER_B64,
+      ed25519: REN_ED25519_PUBLIC_DER_B64,
+    };
+    this.renTransport = {
+      x25519PublicKey: crypto.createPublicKey({ key: Buffer.from(configuredRen.x25519, "base64"), type: "spki", format: "der" }),
+      ed25519PublicKey: crypto.createPublicKey({ key: Buffer.from(configuredRen.ed25519, "base64"), type: "spki", format: "der" }),
+      x25519Fingerprint: sha256(Buffer.from(configuredRen.x25519, "base64")),
+      ed25519Fingerprint: sha256(Buffer.from(configuredRen.ed25519, "base64")),
+    };
+    if (!renPublicKeys && (this.renTransport.x25519Fingerprint !== REN_X25519_FINGERPRINT || this.renTransport.ed25519Fingerprint !== REN_ED25519_FINGERPRINT)) {
+      throw new Error("REN_TRANSPORT_PUBLIC_KEY_FINGERPRINT_MISMATCH");
+    }
     this.running = false;
     this.cursor = this.store.cursor();
     this.lastPollAt = null;
@@ -509,6 +601,394 @@ class TolaCloudRuntime {
     if (!/^CANON_SHA256:[a-f0-9]{64}$/.test(this.canonRevision)) throw new Error("CANON_REVISION_INVALID");
   }
 
+  tolaTransportInfo() {
+    const x25519 = exportPublicDer(this.tolaTransport.x25519.publicKey);
+    const ed25519 = exportPublicDer(this.tolaTransport.ed25519.publicKey);
+    return {
+      protocol: REN_TRANSPORT_PROTOCOL,
+      identity: "TOLA_WHATSAPP",
+      x25519_public_der_b64: x25519.toString("base64"),
+      x25519_fingerprint_sha256: sha256(x25519),
+      ed25519_public_der_b64: ed25519.toString("base64"),
+      ed25519_fingerprint_sha256: sha256(ed25519),
+      ren_x25519_fingerprint_sha256: this.renTransport.x25519Fingerprint,
+      ren_ed25519_fingerprint_sha256: this.renTransport.ed25519Fingerprint,
+    };
+  }
+
+  sealForRen(payload, context) {
+    if (containsCredential(payload)) throw new Error("REN_HANDOFF_CONTAINS_CREDENTIAL");
+    const shared = crypto.diffieHellman({
+      privateKey: this.tolaTransport.x25519.privateKey,
+      publicKey: this.renTransport.x25519PublicKey,
+    });
+    const iv = crypto.randomBytes(12);
+    const aad = stable({ protocol: REN_TRANSPORT_PROTOCOL, context, sender: "TOLA_WHATSAPP", recipient: "MUSE_REN" });
+    const cipher = crypto.createCipheriv("aes-256-gcm", transportKey(shared, aad), iv);
+    cipher.setAAD(Buffer.from(aad));
+    const ciphertext = Buffer.concat([cipher.update(Buffer.from(stable(payload))), cipher.final()]);
+    const unsigned = {
+      protocol: REN_TRANSPORT_PROTOCOL,
+      sender: "TOLA_WHATSAPP",
+      recipient: "MUSE_REN",
+      context,
+      aad_sha256: sha256(aad),
+      iv_b64: iv.toString("base64"),
+      ciphertext_b64: ciphertext.toString("base64"),
+      tag_b64: cipher.getAuthTag().toString("base64"),
+      tola_ed25519_fingerprint_sha256: this.tolaTransportInfo().ed25519_fingerprint_sha256,
+    };
+    return {
+      ...unsigned,
+      signature_b64: crypto.sign(null, Buffer.from(stable(unsigned)), this.tolaTransport.ed25519.privateKey).toString("base64"),
+    };
+  }
+
+  openFromRen(packet, context) {
+    if (!packet || packet.protocol !== REN_TRANSPORT_PROTOCOL || packet.sender !== "MUSE_REN" || packet.recipient !== "TOLA_WHATSAPP" || packet.context !== context) {
+      throw new Error("REN_TRANSPORT_ENVELOPE_INVALID");
+    }
+    const { signature_b64: signature, ...unsigned } = packet;
+    if (!signature || !crypto.verify(null, Buffer.from(stable(unsigned)), this.renTransport.ed25519PublicKey, Buffer.from(signature, "base64"))) {
+      throw new Error("REN_TRANSPORT_SIGNATURE_INVALID");
+    }
+    const aad = stable({ protocol: REN_TRANSPORT_PROTOCOL, context, sender: "MUSE_REN", recipient: "TOLA_WHATSAPP" });
+    if (packet.aad_sha256 !== sha256(aad)) throw new Error("REN_TRANSPORT_AAD_INVALID");
+    const shared = crypto.diffieHellman({
+      privateKey: this.tolaTransport.x25519.privateKey,
+      publicKey: this.renTransport.x25519PublicKey,
+    });
+    const decipher = crypto.createDecipheriv("aes-256-gcm", transportKey(shared, aad), Buffer.from(packet.iv_b64, "base64"));
+    decipher.setAAD(Buffer.from(aad));
+    decipher.setAuthTag(Buffer.from(packet.tag_b64, "base64"));
+    return JSON.parse(Buffer.concat([
+      decipher.update(Buffer.from(packet.ciphertext_b64, "base64")),
+      decipher.final(),
+    ]).toString("utf8"));
+  }
+
+  renHttpAuthorized(request) {
+    const timestamp = Number(request.headers["x-ren-timestamp"]);
+    const nonce = String(request.headers["x-ren-nonce"] || "");
+    const signature = String(request.headers["x-ren-signature"] || "");
+    if (!Number.isSafeInteger(timestamp) || Math.abs(Date.now() - timestamp) > MAX_FRESHNESS_MS) return false;
+    if (!/^[a-f0-9-]{16,80}$/i.test(nonce) || !signature) return false;
+    const bodyHash = sha256(stable(request.body || {}));
+    const canonical = [String(request.method || "").toUpperCase(), String(request.originalUrl || request.url || ""), String(timestamp), nonce, bodyHash].join("\n");
+    try {
+      return crypto.verify(null, Buffer.from(canonical), this.renTransport.ed25519PublicKey, Buffer.from(signature, "base64"));
+    } catch {
+      return false;
+    }
+  }
+
+  renEnvelope(source, ids) {
+    const reference = source.constraints.whatsapp_reference;
+    const createdAt = now();
+    return {
+      schema: "TOLA_REN_HANDOFF_V1",
+      A2A_ID: ids.a2aId,
+      OPPORTUNITY_ID: ids.opportunityId,
+      WANT_ID: ids.wantId,
+      TASK_ID: ids.taskId,
+      TRANSACTION_ID: ids.transactionId,
+      producer_identity: "TOLA_WHATSAPP",
+      recipient_identity: "MUSE_REN",
+      requester: {
+        identity_type: "WHATSAPP_PERSON",
+        participant_id: reference.participant_id,
+        profile_name: reference.profile_name || null,
+      },
+      WANT: source.intent,
+      RELATIONSHIP_ID: reference.relationship_id,
+      CHANNEL_THREAD_ID: reference.thread_id,
+      inbound_provider_message_id: reference.message_id,
+      return_destination: {
+        identity: "TOLA_WHATSAPP",
+        channel: "whatsapp",
+        participant_id: reference.participant_id,
+        relationship_id: reference.relationship_id,
+        channel_thread_id: reference.thread_id,
+      },
+      CANON_REVISION: this.canonRevision,
+      created_at: createdAt,
+      ttl_ms: MAX_TTL_MS,
+      action_class: "RESOLVE",
+      idempotency_key: `ren:handoff:${ids.a2aId}`,
+      payload_ref: { kind: "JOB_INTENT", job_id: source.job_id, sha256: sha256(source.intent) },
+      PAI: {
+        identity: "TOLA_WHATSAPP",
+        authorized: false,
+        scopes: ["PRIVATE_WANT_HANDOFF"],
+        note: "No Damon authority inferred. Consequential effects require current exact PAI/authority in REN.",
+      },
+      authority: {
+        source_identity: "WHATSAPP_PERSON",
+        authorized_scopes: ["PRIVATE_WANT_HANDOFF", "WHATSAPP_PRIVATE_REPLY"],
+        denied_effects: ["impersonate_damon", "bulk_outreach", "public_distribution", "spending", "payment", "contract", "signature"],
+      },
+      next_action: "MUSE_REN_COORDINATE_EXISTING_ESTATE_AND_RETURN_VERIFIED_RESULT",
+    };
+  }
+
+  validateRenEnvelope(envelope, source) {
+    for (const key of ["A2A_ID", "OPPORTUNITY_ID", "WANT_ID", "TASK_ID", "TRANSACTION_ID", "WANT", "RELATIONSHIP_ID", "CHANNEL_THREAD_ID", "inbound_provider_message_id", "producer_identity", "recipient_identity", "CANON_REVISION", "created_at", "ttl_ms", "idempotency_key", "payload_ref", "requester", "return_destination", "PAI", "authority"]) {
+      if (envelope?.[key] === undefined || envelope[key] === null || envelope[key] === "") throw new Error(`REN_HANDOFF_FIELD_REQUIRED:${key}`);
+    }
+    if (containsCredential(envelope)) throw new Error("REN_HANDOFF_CONTAINS_CREDENTIAL");
+    if (envelope.producer_identity !== "TOLA_WHATSAPP" || envelope.recipient_identity !== "MUSE_REN") throw new Error("REN_HANDOFF_IDENTITY_INVALID");
+    if (envelope.CANON_REVISION !== this.canonRevision) throw new Error("REN_HANDOFF_CANON_STALE");
+    if (envelope.idempotency_key !== `ren:handoff:${envelope.A2A_ID}`) throw new Error("REN_HANDOFF_IDEMPOTENCY_INVALID");
+    if (envelope.requester.identity_type !== "WHATSAPP_PERSON" || envelope.requester.participant_id !== source.constraints.whatsapp_reference.participant_id) throw new Error("REN_HANDOFF_REQUESTER_INVALID");
+    if (envelope.requester.identity_type === "DAMON" || envelope.PAI.identity === "DAMON") throw new Error("REN_HANDOFF_AUTHORITY_ESCALATION");
+    if (envelope.RELATIONSHIP_ID !== source.constraints.whatsapp_reference.relationship_id || envelope.CHANNEL_THREAD_ID !== source.constraints.whatsapp_reference.thread_id) throw new Error("REN_HANDOFF_CONTINUITY_INVALID");
+    if (envelope.return_destination.relationship_id !== envelope.RELATIONSHIP_ID || envelope.return_destination.channel_thread_id !== envelope.CHANNEL_THREAD_ID) throw new Error("REN_HANDOFF_RETURN_DESTINATION_INVALID");
+    if (envelope.payload_ref.job_id !== source.job_id || envelope.payload_ref.sha256 !== sha256(source.intent)) throw new Error("REN_HANDOFF_PAYLOAD_INVALID");
+    const created = Date.parse(envelope.created_at);
+    if (!Number.isFinite(created) || Date.now() - created > MAX_FRESHNESS_MS || Date.now() >= created + Number(envelope.ttl_ms)) throw new Error("REN_HANDOFF_STALE");
+    return true;
+  }
+
+  validateRenCompletion(completion, work) {
+    if (!completion || !REN_RESULT_STATES.has(completion.status)) throw new Error("REN_RESULT_STATE_INVALID");
+    if (completion.TASK_ID !== work.result?.TASK_ID || completion.A2A_ID !== work.result?.A2A_ID) throw new Error("REN_RESULT_CONTINUITY_INVALID");
+    if (completion.producer_identity !== "MUSE_REN" || completion.recipient_identity !== "TOLA_WHATSAPP") throw new Error("REN_RESULT_IDENTITY_INVALID");
+    if (completion.CANON_REVISION !== this.canonRevision) throw new Error("REN_RESULT_CANON_STALE");
+    if (!completion.execution_id || !completion.completed_at || !completion.receipt?.receipt_id || !Array.isArray(completion.evidence)) throw new Error("REN_RESULT_EXECUTION_PROOF_REQUIRED");
+    const completedAt = Date.parse(completion.completed_at);
+    if (!Number.isFinite(completedAt) || completedAt < Date.parse(work.created_at) || completedAt > Date.now() + 30000) throw new Error("REN_RESULT_TIMESTAMP_INVALID");
+    if (!new Set(["COMPLETED", "BLOCKED"]).has(completion.receipt.status)) throw new Error("REN_RESULT_RECEIPT_STATUS_INVALID");
+    if (completion.evidence.length > 100) throw new Error("REN_RESULT_EVIDENCE_LIMIT_EXCEEDED");
+    if (!completion.evidence.some(item => item?.verified === true && !/ACK|ACCEPT/i.test(String(item.type || "")))) throw new Error("REN_RESULT_VERIFIED_EXECUTION_EVIDENCE_REQUIRED");
+    if (typeof completion.result !== "string" || !completion.result.trim() || Buffer.byteLength(completion.result) > 65536) throw new Error("REN_RESULT_OUTPUT_REQUIRED");
+    if (!/^NONE(?:_|$)/.test(String(completion.external_action_performed || "NONE")) && (!completion.authority_ref || !completion.PAI_ref)) throw new Error("REN_RESULT_CONSEQUENTIAL_AUTHORITY_EVIDENCE_REQUIRED");
+    if (containsCredential(completion)) throw new Error("REN_RESULT_CONTAINS_CREDENTIAL");
+    return true;
+  }
+
+  async sendRenAcceptance(source, work) {
+    const reference = source.constraints.whatsapp_reference;
+    const key = `whatsapp:ren-accepted:${shortHash(reference.action_id)}`;
+    const prior = this.store.receipt(key);
+    const action = prior?.status === "FAILED" ? this.store.retryFailedAction(source.job_id, key) : this.store.beginAction(source.job_id, key);
+    if (!action.execute) return action.receipt?.result || null;
+    try {
+      const sent = await this.sendReply(reference, "I’m on it.");
+      const result = {
+        status: "TOLA_ACCEPTED",
+        task_id: work.result.TASK_ID,
+        A2A_ID: work.result.A2A_ID,
+        inbound_provider_message_id: reference.message_id,
+        outbound_provider_message_id: sent.provider_message_id,
+        relationship_id: reference.relationship_id,
+        channel_thread_id: reference.thread_id,
+        delivery_state: "accepted",
+      };
+      const evidence = [{ type: "TOLA_WHATSAPP_ACCEPTANCE_SENT", verified: true, provider_message_id: sent.provider_message_id, at: now() }];
+      this.store.finishAction(source.job_id, key, result, evidence);
+      this.store.appendEffectOnce(`TOLA_REN:acceptance-delivery:${work.result.A2A_ID}`, "OUTBOUND_SENT", {
+        job_id: source.job_id, opportunity_id: work.result.OPPORTUNITY_ID, want_id: work.result.WANT_ID,
+        producer_identity: "TOLA_WHATSAPP", channel: "whatsapp", destination: reference.relationship_id,
+        authority_state: "PRIVATE_ACCEPTANCE_ONLY", message_ref: { inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id },
+        evidence_ref: `whatsapp-acceptance:${sent.provider_message_id}`,
+      });
+      return result;
+    } catch (error) {
+      this.store.failAction(source.job_id, key, error);
+      return null;
+    }
+  }
+
+  async queueRenHandoff(source, ids) {
+    const taskId = ids.taskId || `ren-task-${shortHash(ids.a2aId)}`;
+    const envelope = this.renEnvelope(source, { ...ids, taskId });
+    this.validateRenEnvelope(envelope, source);
+    const created = this.store.createJob({
+      parent_job_id: source.job_id,
+      root_job_id: source.root_job_id,
+      delta_id: ids.opportunityId,
+      worker_type: "MUSE_REN_HANDOFF",
+      owner: "MUSE_REN",
+      intent: `Coordinate existing estate work for ${taskId}`,
+      success_condition: "REN returns verified execution evidence and TOLA delivers the result to the original WhatsApp thread",
+      idempotency_key: envelope.idempotency_key,
+      priority: 95,
+      state: "READY",
+      started_at: null,
+      completed_at: null,
+      execution_attempted_at: null,
+      max_attempts: 20,
+      constraints: {
+        actionable: true,
+        ren_envelope: envelope,
+        ren_envelope_hash: sha256(envelope),
+        external_effects: "CURRENT_EXACT_AUTHORITY_AND_PAI_REQUIRED",
+      },
+      provenance: {
+        source: "TOLA_REN_HANDOFF",
+        producer_identity: "TOLA_WHATSAPP",
+        recipient_identity: "MUSE_REN",
+        canon_revision: this.canonRevision,
+      },
+      result: {
+        status: "QUEUED_FOR_MUSE_REN",
+        TASK_ID: taskId,
+        A2A_ID: ids.a2aId,
+        OPPORTUNITY_ID: ids.opportunityId,
+        WANT_ID: ids.wantId,
+        RELATIONSHIP_ID: envelope.RELATIONSHIP_ID,
+        CHANNEL_THREAD_ID: envelope.CHANNEL_THREAD_ID,
+        return_destination: envelope.return_destination,
+      },
+      checkpoint: { phase: "QUEUED", execution_count: 0, delivery_count: 0 },
+    });
+    if (!created.duplicate) {
+      this.store.event(created.job.job_id, "REN_HANDOFF_QUEUED", { TASK_ID: taskId, A2A_ID: ids.a2aId, producer_identity: "TOLA_WHATSAPP", recipient_identity: "MUSE_REN" });
+      this.store.appendEffectOnce(`TOLA_REN:queued:${ids.a2aId}`, "REN_HANDOFF_QUEUED", {
+        job_id: created.job.job_id,
+        opportunity_id: ids.opportunityId,
+        want_id: ids.wantId,
+        producer_identity: "TOLA_WHATSAPP",
+        destination: "MUSE_REN",
+        authority_state: "HANDOFF_ONLY_NO_AUTHORITY_EXPANSION",
+        message_ref: { A2A_ID: ids.a2aId, TASK_ID: taskId, relationship_id: envelope.RELATIONSHIP_ID },
+        evidence_ref: `ren-handoff:${sha256(envelope)}`,
+      });
+    }
+    const updatedSource = this.store.updateJob(source.job_id, {
+      result: { ...source.result, ren_handoff_job_id: created.job.job_id, TASK_ID: taskId, A2A_ID: ids.a2aId, OPPORTUNITY_ID: ids.opportunityId, WANT_ID: ids.wantId },
+      checkpoint: { ...source.checkpoint, phase: "ACCEPTED", ren_handoff_job_id: created.job.job_id },
+    });
+    await this.sendRenAcceptance(updatedSource, created.job);
+    return created.job;
+  }
+
+  recordRenAcceptance(work, acceptance) {
+    if (!acceptance?.accepted || !acceptance.acceptance_id || acceptance.TASK_ID !== work.result.TASK_ID) throw new Error("REN_ACCEPTANCE_INVALID");
+    const key = `ren:acceptance:${work.result.A2A_ID}`;
+    const action = this.store.beginAction(work.job_id, key);
+    if (!action.execute) return this.store.get(work.job_id);
+    const result = { ...work.result, status: "ACCEPTED_BY_MUSE_REN", ren_acceptance_id: acceptance.acceptance_id, accepted_at: acceptance.accepted_at || now() };
+    const evidence = [{ type: "REN_HANDOFF_ACCEPTED", verified: true, acceptance_id: acceptance.acceptance_id, task_id: work.result.TASK_ID, at: result.accepted_at }];
+    this.store.finishAction(work.job_id, key, result, evidence);
+    const updated = this.store.updateJob(work.job_id, { state: "WAITING_EXTERNAL", result, evidence: [...work.evidence, ...evidence], checkpoint: { ...work.checkpoint, phase: "ACCEPTED_BY_REN" } });
+    this.store.appendEffectOnce(`TOLA_REN:accepted:${work.result.A2A_ID}`, "REN_HANDOFF_ACCEPTED", {
+      job_id: work.job_id, opportunity_id: work.result.OPPORTUNITY_ID, want_id: work.result.WANT_ID,
+      producer_identity: "MUSE_REN", destination: "TOLA_WHATSAPP", authority_state: "HANDOFF_ACCEPTED_NO_EXECUTION_CLAIM",
+      message_ref: { A2A_ID: work.result.A2A_ID, TASK_ID: work.result.TASK_ID, acceptance_id: acceptance.acceptance_id },
+      evidence_ref: `ren-acceptance:${acceptance.acceptance_id}`,
+    });
+    return updated;
+  }
+
+  recordRenCompletion(work, completion) {
+    this.validateRenCompletion(completion, work);
+    const key = `ren:result:${work.result.A2A_ID}`;
+    const action = this.store.beginAction(work.job_id, key);
+    if (!action.execute) return this.store.get(work.job_id);
+    const result = { ...work.result, status: completion.status, ren_completion: completion, result_ref: `ren:result:${completion.execution_id}` };
+    const evidence = [{ type: "REN_VERIFIED_WORK_COMPLETION", verified: true, execution_id: completion.execution_id, receipt_id: completion.receipt.receipt_id, at: completion.completed_at }, ...completion.evidence];
+    this.store.finishAction(work.job_id, key, result, evidence);
+    const updated = this.store.updateJob(work.job_id, {
+      state: "COMPLETED", completed_at: completion.completed_at, result, evidence: [...work.evidence, ...evidence],
+      terminal_state: completion.status === "COMPLETED" ? "EXECUTED" : "WAITING_DEPENDENCY",
+      terminal_evidence: { executor_invoked: "MUSE_REN", execution_id: completion.execution_id, external_action_performed: completion.external_action_performed || "NONE_OR_AS_EVIDENCED", authority_result: completion.authority_state || "CURRENT_AUTHORITY_CHECKED" },
+      checkpoint: { ...work.checkpoint, phase: "WORK_COMPLETED", execution_count: 1 },
+    });
+    this.store.appendEffectOnce(`TOLA_REN:completed:${work.result.A2A_ID}`, "REN_WORK_COMPLETED", {
+      job_id: work.job_id, opportunity_id: work.result.OPPORTUNITY_ID, want_id: work.result.WANT_ID,
+      producer_identity: "MUSE_REN", destination: "TOLA_WHATSAPP", authority_state: completion.authority_state || "CURRENT_AUTHORITY_CHECKED",
+      message_ref: { A2A_ID: work.result.A2A_ID, TASK_ID: work.result.TASK_ID, execution_id: completion.execution_id, receipt_id: completion.receipt.receipt_id },
+      evidence_ref: `ren-result:${completion.execution_id}`,
+    });
+    return updated;
+  }
+
+  async deliverRenResult(work) {
+    const completion = work.result?.ren_completion;
+    if (!completion) return null;
+    const source = this.store.get(work.parent_job_id);
+    if (!source) throw new Error("REN_RESULT_SOURCE_JOB_MISSING");
+    const reference = source.constraints.whatsapp_reference;
+    const key = `whatsapp:ren-result:${shortHash(reference.action_id)}`;
+    const prior = this.store.receipt(key);
+    const action = prior?.status === "FAILED" ? this.store.retryFailedAction(source.job_id, key) : this.store.beginAction(source.job_id, key);
+    if (!action.execute) return action.receipt?.result || prior?.result || null;
+    try {
+      const sent = await this.sendReply(reference, normalizeReply(completion.result, "The work is complete."));
+      const result = {
+        status: "REN_RESULT_DELIVERED",
+        task_id: work.result.TASK_ID,
+        A2A_ID: work.result.A2A_ID,
+        OPPORTUNITY_ID: work.result.OPPORTUNITY_ID,
+        WANT_ID: work.result.WANT_ID,
+        ren_execution_id: completion.execution_id,
+        ren_receipt_id: completion.receipt.receipt_id,
+        inbound_provider_message_id: reference.message_id,
+        outbound_provider_message_id: sent.provider_message_id,
+        relationship_id: reference.relationship_id,
+        channel_thread_id: reference.thread_id,
+        delivery_state: "accepted",
+      };
+      const evidence = [{ type: "TOLA_REN_RESULT_DELIVERED", verified: true, execution_id: completion.execution_id, provider_message_id: sent.provider_message_id, relationship_id: reference.relationship_id, at: now() }];
+      this.store.finishAction(source.job_id, key, result, evidence);
+      this.store.updateJob(source.job_id, {
+        result: { ...source.result, outbound: result, outbound_receipt_id: key },
+        evidence: [...source.evidence, ...evidence],
+        checkpoint: { ...source.checkpoint, phase: "RESULT_DELIVERED", delivery_count: 1 },
+      });
+      this.store.updateJob(work.job_id, { checkpoint: { ...work.checkpoint, phase: "RESULT_DELIVERED", delivery_count: 1 } });
+      this.store.appendEffectOnce(`TOLA_REN:delivered:${work.result.A2A_ID}`, "OUTBOUND_SENT", {
+        job_id: source.job_id, opportunity_id: work.result.OPPORTUNITY_ID, want_id: work.result.WANT_ID,
+        producer_identity: "TOLA_WHATSAPP", channel: "whatsapp", destination: reference.relationship_id,
+        counterparty: "TOLA", authority_state: "EXACT_PRIVATE_RESULT_RETURN_AUTHORIZED",
+        message_ref: { inbound_provider_message_id: reference.message_id, outbound_provider_message_id: sent.provider_message_id, A2A_ID: work.result.A2A_ID, TASK_ID: work.result.TASK_ID },
+        evidence_ref: `whatsapp-ren-result:${sent.provider_message_id}`,
+      });
+      return result;
+    } catch (error) {
+      this.store.failAction(source.job_id, key, error);
+      this.store.updateJob(work.job_id, { checkpoint: { ...work.checkpoint, phase: "DELIVERY_RETRY_PENDING", execution_count: 1, delivery_count: 0, last_delivery_error: safeError(error) } });
+      return null;
+    }
+  }
+
+  async recoverRenTransactions() {
+    const outcomes = [];
+    const jobs = this.store.list("MUSE_REN_HANDOFF");
+    for (let work of jobs) {
+      if (work.state === "READY" && this.renAdapter) {
+        const key = `ren:submit:${work.result.A2A_ID}`;
+        const prior = this.store.receipt(key);
+        const action = prior?.status === "FAILED" ? this.store.retryFailedAction(work.job_id, key) : this.store.beginAction(work.job_id, key);
+        if (action.execute) {
+          try {
+            const acceptance = await this.renAdapter.submit(work.constraints.ren_envelope);
+            this.store.finishAction(work.job_id, key, acceptance, [{ type: "REN_TRANSPORT_SUBMIT", verified: true, acceptance_id: acceptance?.acceptance_id || null, at: now() }]);
+            work = this.recordRenAcceptance(this.store.get(work.job_id), acceptance);
+          } catch (error) {
+            this.store.failAction(work.job_id, key, error);
+            this.store.updateJob(work.job_id, { state: "WAITING_EXTERNAL", checkpoint: { ...work.checkpoint, phase: "REN_TRANSPORT_RETRY_PENDING", last_transport_error: safeError(error) } });
+            outcomes.push({ task_id: work.result.TASK_ID, state: "WAITING_EXTERNAL", error: safeError(error) });
+            continue;
+          }
+        }
+      }
+      work = this.store.get(work.job_id);
+      if (["READY", "WAITING_EXTERNAL"].includes(work.state) && this.renAdapter) {
+        const completion = await this.renAdapter.status(work.result.TASK_ID, work.constraints.ren_envelope);
+        if (completion) work = this.recordRenCompletion(work, completion);
+      }
+      if (work.state === "COMPLETED" && work.result?.ren_completion) {
+        const delivered = await this.deliverRenResult(work);
+        outcomes.push({ task_id: work.result.TASK_ID, state: delivered ? "RESULT_DELIVERED" : "DELIVERY_PENDING" });
+      } else {
+        outcomes.push({ task_id: work.result.TASK_ID, state: work.state });
+      }
+    }
+    return outcomes;
+  }
+
   mount() {
     this.app.get("/tola-cloud/health", (_request, response) => {
       const cloud = this.store.availability("OPENAI_COMMAND_TOWER_RUNTIME", 90000);
@@ -526,8 +1006,61 @@ class TolaCloudRuntime {
           state: this.museCapabilities().state,
         },
         genuine_video_generation: this.publicVideoAvailability(),
+        ren_transport: {
+          protocol: REN_TRANSPORT_PROTOCOL,
+          state: this.renAdapter ? "ADAPTER_CONNECTED" : "AWAITING_REN_RECEIVER_POLL",
+          queued: this.store.list("MUSE_REN_HANDOFF").filter(job => ["READY", "WAITING_EXTERNAL"].includes(job.state)).length,
+          completed_awaiting_delivery: this.store.list("MUSE_REN_HANDOFF").filter(job => job.state === "COMPLETED" && job.checkpoint?.phase !== "RESULT_DELIVERED").length,
+        },
         quoted_reply_context: false,
       });
+    });
+
+    this.app.get("/tola-cloud/ren/transport", (_request, response) => {
+      response.json({ ok: true, ...this.tolaTransportInfo(), task_route: "/tola-cloud/ren/tasks", result_route: "/tola-cloud/ren/tasks/:taskId/result" });
+    });
+
+    this.app.get("/tola-cloud/ren/tasks", (request, response) => {
+      if (!this.renHttpAuthorized(request)) return response.status(401).json({ ok: false, error: "REN_SIGNATURE_REQUIRED" });
+      const pending = this.store.list("MUSE_REN_HANDOFF")
+        .filter(job => ["READY", "WAITING_EXTERNAL"].includes(job.state))
+        .slice(0, 20)
+        .map(job => ({
+          task_id: job.result.TASK_ID,
+          A2A_ID: job.result.A2A_ID,
+          state: job.state,
+          envelope: this.sealForRen(job.constraints.ren_envelope, `task:${job.result.TASK_ID}`),
+        }));
+      response.json({ ok: true, protocol: REN_TRANSPORT_PROTOCOL, tasks: pending });
+    });
+
+    this.app.post("/tola-cloud/ren/tasks/:taskId/acceptance", (request, response) => {
+      if (!this.renHttpAuthorized(request)) return response.status(401).json({ ok: false, error: "REN_SIGNATURE_REQUIRED" });
+      try {
+        const work = this.store.list("MUSE_REN_HANDOFF").find(job => job.result?.TASK_ID === request.params.taskId);
+        if (!work) return response.status(404).json({ ok: false, error: "TASK_NOT_FOUND" });
+        const acceptance = this.openFromRen(request.body, `acceptance:${request.params.taskId}`);
+        const updated = this.recordRenAcceptance(work, acceptance);
+        response.json({ ok: true, duplicate: updated.result?.ren_acceptance_id === work.result?.ren_acceptance_id, task_id: request.params.taskId, state: updated.state });
+      } catch (error) {
+        response.status(400).json({ ok: false, error: safeError(error) });
+      }
+    });
+
+    this.app.post("/tola-cloud/ren/tasks/:taskId/result", async (request, response) => {
+      if (!this.renHttpAuthorized(request)) return response.status(401).json({ ok: false, error: "REN_SIGNATURE_REQUIRED" });
+      try {
+        let work = this.store.list("MUSE_REN_HANDOFF").find(job => job.result?.TASK_ID === request.params.taskId);
+        if (!work) return response.status(404).json({ ok: false, error: "TASK_NOT_FOUND" });
+        if (!this.store.receipt(`ren:acceptance:${work.result.A2A_ID}`)) return response.status(409).json({ ok: false, error: "REN_ACCEPTANCE_REQUIRED" });
+        const completion = this.openFromRen(request.body, `result:${request.params.taskId}`);
+        const prior = this.store.receipt(`ren:result:${work.result.A2A_ID}`);
+        work = this.recordRenCompletion(work, completion);
+        const delivered = await this.deliverRenResult(work);
+        response.json({ ok: true, duplicate: Boolean(prior), task_id: request.params.taskId, state: delivered ? "RESULT_DELIVERED" : "DELIVERY_PENDING" });
+      } catch (error) {
+        response.status(400).json({ ok: false, error: safeError(error) });
+      }
     });
 
     this.app.get("/tola-cloud/receipt/:a2aId", (request, response) => {
@@ -1027,7 +1560,7 @@ class TolaCloudRuntime {
       metadata: {
         a2a_id: envelope.A2A_ID,
         opportunity_id: envelope.OPPORTUNITY_ID,
-        producer: "MUSE_REN",
+        producer: "META_MODEL_PROVIDER",
         canon_revision: sha256(envelope.CANON_REVISION),
       },
     };
@@ -1587,6 +2120,7 @@ class TolaCloudRuntime {
       const checkpoint = { ...(existingJob.checkpoint || {}), duplicate_count: Number(existingJob.checkpoint?.duplicate_count || 0) + 1, last_replay_at: now() };
       this.store.updateJob(existingJob.job_id, { checkpoint });
       this.store.event(existingJob.job_id, "TOLA_WHATSAPP_REPLAY_SUPPRESSED", { inbound_message_id: reference.message_id, duplicate_execution: false, duplicate_reply: false, at: now() });
+      if (existingJob.result?.ren_handoff_job_id) await this.recoverRenTransactions();
       return { duplicate: true, job_id: existingJob.job_id, a2a_id: existingJob.result?.A2A_ID || existingJob.result?.outbound?.A2A_ID || null, duplicate_execution: false, duplicate_reply: false };
     }
     const intent = this.intentFor(message);
@@ -1610,6 +2144,25 @@ class TolaCloudRuntime {
     const inboundAction = this.store.beginAction(source.job_id, reference.action_id);
     if (inboundAction.execute) this.store.finishAction(source.job_id, reference.action_id, inboundResult, source.evidence);
     this.store.appendEffect("RESPONSE_RECEIVED", { job_id: source.job_id, opportunity_id: opportunityId, want_id: wantId, producer_identity: "TOLA_WHATSAPP", channel: "whatsapp", message_ref: { inbound_provider_message_id: reference.message_id, relationship_id: reference.relationship_id }, authority_state: "PRIVATE_MESSAGE_ACCEPTED", evidence_ref: `whatsapp-inbound:${reference.action_id}` });
+
+    if (!media && isRenExecutionWant(intent)) {
+      const work = await this.queueRenHandoff(source, { a2aId, opportunityId, wantId, transactionId });
+      const recovered = await this.recoverRenTransactions();
+      const currentWork = this.store.get(work.job_id);
+      const delivered = this.store.receipt(`whatsapp:ren-result:${shortHash(reference.action_id)}`)?.result || null;
+      return {
+        duplicate: false,
+        job_id: source.job_id,
+        ren_handoff_job_id: work.job_id,
+        task_id: work.result.TASK_ID,
+        a2a_id: a2aId,
+        state: currentWork.state,
+        ren_transport: this.renAdapter ? "ADAPTER_CONNECTED" : "AWAITING_REN_RECEIVER_POLL",
+        provider_message_id: delivered?.outbound_provider_message_id || null,
+        ren_execution_id: delivered?.ren_execution_id || null,
+        recovery: recovered.find(item => item.task_id === work.result.TASK_ID) || null,
+      };
+    }
 
     const issued = now(), expires = new Date(Date.now() + MAX_TTL_MS).toISOString();
     const envelope = {
@@ -1857,13 +2410,16 @@ class TolaCloudRuntime {
   }
 
   async pollOnce() {
+    const recovered = await this.recoverRenTransactions();
     const query = new URLSearchParams({ limit: "50", timeout: "25" });
     if (Number.isSafeInteger(this.cursor.next_offset)) query.set("offset", String(this.cursor.next_offset));
     const response = await this.provider(`/updates?${query}`, { timeoutMs: 40000 });
     this.lastPollAt = now();
     this.store.heartbeat("OPENAI_COMMAND_TOWER_RUNTIME", "ONLINE", { receiver: "TOLA_WHATSAPP", canon_revision: this.canonRevision, enabled: this.enabled });
-    if (response.status === 204) return [];
-    return this.processPayload(response.body);
+    if (response.status === 204) return recovered;
+    const outcomes = await this.processPayload(response.body);
+    await this.recoverRenTransactions();
+    return outcomes;
   }
 
   async start() {

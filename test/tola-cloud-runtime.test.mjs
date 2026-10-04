@@ -71,6 +71,112 @@ test("private inbound replay produces one reasoning call and one reply", async t
   assert.equal(receipt.result.duplicate_execution, false);
 });
 
+test("execution WANT uses real REN handoff, survives restart, retries delivery only, and exact replay is inert", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-ren-handoff-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const canon = "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358";
+  const calls = { submit: 0, executions: 0, status: 0, send_attempts: 0, accepted_replies: 0, openai: 0 };
+  let failResultDelivery = true;
+  let submittedEnvelope = null;
+  const renAdapter = {
+    submit: async envelope => {
+      calls.submit += 1;
+      calls.executions += 1;
+      submittedEnvelope = envelope;
+      return { accepted: true, TASK_ID: envelope.TASK_ID, acceptance_id: "ren-acceptance-no-send-1", accepted_at: new Date().toISOString() };
+    },
+    status: async (taskId, envelope) => {
+      calls.status += 1;
+      return {
+        status: "COMPLETED",
+        TASK_ID: taskId,
+        A2A_ID: envelope.A2A_ID,
+        producer_identity: "MUSE_REN",
+        recipient_identity: "TOLA_WHATSAPP",
+        CANON_REVISION: canon,
+        execution_id: "ren-execution-no-send-1",
+        completed_at: new Date().toISOString(),
+        result: "Verified internal estate check completed with execution evidence.",
+        receipt: { receipt_id: "ren-receipt-no-send-1", status: "COMPLETED" },
+        authority_state: "INTERNAL_NO_SEND_AUTHORIZED",
+        external_action_performed: "NONE_NO_SEND_TEST",
+        evidence: [{ type: "REN_NO_SEND_ADAPTER_EXECUTION", verified: true, execution_count: 1 }],
+      };
+    },
+  };
+  const fetchImpl = async (url, options = {}) => {
+    if (String(url).includes("api.openai.com")) {
+      calls.openai += 1;
+      throw new Error("execution WANT must not be replaced by model chat");
+    }
+    if (String(url).endsWith("/messages")) {
+      calls.send_attempts += 1;
+      const request = JSON.parse(options.body);
+      if (request.text.body !== "I’m on it." && failResultDelivery) {
+        failResultDelivery = false;
+        throw new Error("simulated pre-accept transport failure");
+      }
+      calls.accepted_replies += 1;
+      return jsonResponse(200, {
+        contacts: [{ wa_id: request.to }],
+        messages: [{ id: request.text.body === "I’m on it." ? "wamid.ren-accepted" : "wamid.ren-result" }],
+      });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  };
+  const env = {
+    TOLA_STATE_DIR: stateDir,
+    TOLA_WHATSAPP_API_KEY: "test-provider-token",
+    OPENAI_API_KEY: "test-openai-token",
+    CANON_REVISION: canon,
+  };
+  const message = {
+    id: "wamid.ren-handoff-in",
+    from: "user:15550001111",
+    type: "text",
+    text: { body: "Coordinate a no-send estate verification and deliver the verified result." },
+  };
+
+  const firstRuntime = new TolaCloudRuntime({ app: {}, fetchImpl, renAdapter, env });
+  const first = await firstRuntime.handleMessage("123456", message, [{ wa_id: "user:15550001111", profile: { name: "Customer" } }]);
+  assert.equal(first.state, "COMPLETED");
+  assert.equal(first.ren_execution_id, null);
+  assert.deepEqual(calls, { submit: 1, executions: 1, status: 1, send_attempts: 2, accepted_replies: 1, openai: 0 });
+  assert.equal(submittedEnvelope.requester.identity_type, "WHATSAPP_PERSON");
+  assert.equal(submittedEnvelope.requester.participant_id, "user:15550001111");
+  assert.equal(submittedEnvelope.PAI.authorized, false);
+  assert.doesNotMatch(JSON.stringify(submittedEnvelope), /requester[^}]*DAMON/i);
+  assert.equal(submittedEnvelope.return_destination.relationship_id, submittedEnvelope.RELATIONSHIP_ID);
+  const firstWork = firstRuntime.store.get(first.ren_handoff_job_id);
+  assert.equal(firstWork.checkpoint.phase, "DELIVERY_RETRY_PENDING");
+  assert.equal(firstWork.checkpoint.execution_count, 1);
+  assert.equal(firstRuntime.store.receipt(`ren:result:${first.a2a_id}`).status, "COMPLETED");
+  firstRuntime.store.db.close();
+
+  const restartedRuntime = new TolaCloudRuntime({ app: {}, fetchImpl, renAdapter, env });
+  const recovery = await restartedRuntime.recoverRenTransactions();
+  assert.deepEqual(recovery, [{ task_id: first.task_id, state: "RESULT_DELIVERED" }]);
+  assert.deepEqual(calls, { submit: 1, executions: 1, status: 1, send_attempts: 3, accepted_replies: 2, openai: 0 });
+  const recoveredWork = restartedRuntime.store.get(first.ren_handoff_job_id);
+  assert.equal(recoveredWork.checkpoint.phase, "RESULT_DELIVERED");
+  assert.equal(recoveredWork.checkpoint.execution_count, 1);
+  assert.equal(recoveredWork.checkpoint.delivery_count, 1);
+  const resultReceipt = restartedRuntime.store.receipt(`whatsapp:ren-result:${sha256(restartedRuntime.reference("123456", message, null).action_id).slice(0, 32)}`);
+  assert.equal(resultReceipt.status, "COMPLETED");
+  assert.equal(resultReceipt.result.outbound_provider_message_id, "wamid.ren-result");
+  const receiptCountBeforeReplay = Number(restartedRuntime.store.db.prepare("SELECT COUNT(*) count FROM action_receipts").get().count);
+  const effectCountBeforeReplay = fs.readFileSync(restartedRuntime.store.effectsFile, "utf8").split(/\r?\n/).filter(Boolean).length;
+
+  const replay = await restartedRuntime.handleMessage("123456", message, []);
+  assert.equal(replay.duplicate, true);
+  assert.equal(replay.duplicate_execution, false);
+  assert.equal(replay.duplicate_reply, false);
+  assert.deepEqual(calls, { submit: 1, executions: 1, status: 1, send_attempts: 3, accepted_replies: 2, openai: 0 });
+  assert.equal(Number(restartedRuntime.store.db.prepare("SELECT COUNT(*) count FROM action_receipts").get().count), receiptCountBeforeReplay);
+  assert.equal(fs.readFileSync(restartedRuntime.store.effectsFile, "utf8").split(/\r?\n/).filter(Boolean).length, effectCountBeforeReplay);
+  restartedRuntime.store.db.close();
+});
+
 test("authenticated Muse Spark participates in the existing command tower and exact replay calls neither runtime twice", async t => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-muse-"));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
@@ -81,7 +187,7 @@ test("authenticated Muse Spark participates in the existing command tower and ex
       calls.muse += 1;
       const request = JSON.parse(options.body);
       assert.equal(request.model, "muse-spark-1.3");
-      assert.equal(request.metadata.producer, "MUSE_REN");
+      assert.equal(request.metadata.producer, "META_MODEL_PROVIDER");
       assert.deepEqual(request.tools, [{ type: "web_search" }]);
       return jsonResponse(200, { id: "muse_resp_1", output_text: "Verified Muse research evidence." });
     }
@@ -356,10 +462,10 @@ test("TOLA behavior contract precedes capability reasoning and survives restart 
     text: { body: "What can u do" },
   });
   assert.equal(first.duplicate, false);
-  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V6_LIVE_MUSE_REGISTRY/);
+  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V7_REAL_REN_HANDOFF/);
   assert.match(requests[0].instructions, /CURRENT MESSAGE CLASSIFICATION: CAPABILITY QUESTION/);
   assert.match(requests[0].instructions, /Never give a generic capability list/);
-  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V6_LIVE_MUSE_REGISTRY");
+  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V7_REAL_REN_HANDOFF");
   assert.doesNotMatch(JSON.stringify(requests[0]), /META_MUSE_VIDEO_API|TOLA_META_MUSE_VIDEO_API_UNAVAILABLE/);
   assert.equal(sent[0].text.body, "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.");
   firstRuntime.store.db.close();
@@ -422,10 +528,10 @@ test("hydrated image reasoning receives the same TOLA behavior contract", async 
     type: "image",
     image: { id: "media-contract-1", mime_type: "image/jpeg", sha256: digest, caption: "Use this image for the clear WANT." },
   });
-  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V6_LIVE_MUSE_REGISTRY/);
+  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V7_REAL_REN_HANDOFF/);
   assert.match(openaiRequest.instructions, /CURRENT MESSAGE CLASSIFICATION: WANT OR CONTINUATION/);
   assert.equal(openaiRequest.input[0].content[1].type, "input_image");
-  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V6_LIVE_MUSE_REGISTRY");
+  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V7_REAL_REN_HANDOFF");
 });
 
 test("a migrated local receipt suppresses a pre-cloud provider replay", async t => {
