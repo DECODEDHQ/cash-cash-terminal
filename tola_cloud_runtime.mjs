@@ -5,7 +5,6 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
-import { createFalClient } from "@fal-ai/client";
 
 const PROVIDER_BASE = "https://api.whatsapp.com/agent/v1";
 const OPENAI_URL = "https://api.openai.com/v1/responses";
@@ -42,12 +41,12 @@ const MEDIA_LIMITS = Object.freeze({
   document: 32 * 1024 * 1024,
 });
 const WHATSAPP_OUTBOUND_MEDIA_LIMIT = 16 * 1024 * 1024;
-const PRIVATE_MEDIA_CAPABILITY_VERSION = "private-media-v2-genuine-video";
+const PRIVATE_MEDIA_CAPABILITY_VERSION = "private-media-v3-meta-muse-video";
 const PRIVATE_MEDIA_SCOPE = "PRIVATE_ARTIFACT_CREATE";
-const DEFAULT_VIDEO_MODEL = "fal-ai/kling-video/v2.6/pro/text-to-video";
+const DEFAULT_VIDEO_PRODUCT = "Meta Muse Video";
 const DEFAULT_REPLY = "Tell me what you want. I’ll work out the rest.";
 const CAPABILITY_REPLY = "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.";
-const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V4_CUSTOMER_SAFE_BLOCKERS";
+const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_EXECUTION_LAW_2026-10-04_V5_META_MUSE_VIDEO";
 const TOLA_BEHAVIOR_CONTRACT = [
   `TOLA BEHAVIOR CONTRACT ${TOLA_BEHAVIOR_CONTRACT_REVISION}. This contract applies to every WhatsApp response and takes priority over generic assistant behavior.`,
   "TOLA is a human-facing execution agent, not a generic chatbot. Speak as TOLA and return only the direct WhatsApp reply.",
@@ -156,7 +155,7 @@ function normalizeReply(value, fallback = DEFAULT_REPLY) {
     .trim()
     .slice(0, 4096);
   if (!reply) return fallback;
-  if (/\b(?:FAL_KEY|TOLA_VIDEO_[A-Z0-9_]*|OPENAI_[A-Z0-9_]*|CANON_SHA256|PRIVATE_ARTIFACT_CREATE|FFMPEG)\b/i.test(reply)) {
+  if (/\b(?:META_MUSE_VIDEO_[A-Z0-9_]*|TOLA_VIDEO_[A-Z0-9_]*|OPENAI_[A-Z0-9_]*|CANON_SHA256|PRIVATE_ARTIFACT_CREATE|FFMPEG)\b/i.test(reply)) {
     return "Genuine video generation isn’t available yet, so I haven’t sent a fake substitute.";
   }
   if (/\b(?:i(?:'m| am) an ai assistant|i can(?:not|'t) (?:take real[- ]world actions|generate|create|make|produce|render)|i can only help you think|if you want, i can|ready-to-run prompt|generator prompt)\b/i.test(reply)) return fallback;
@@ -187,6 +186,7 @@ function validGeneratedImage(bytes) {
 
 function capabilityFailureReply(error) {
   const code = safeError(error);
+  if (/TOLA_META_MUSE_VIDEO_API_UNAVAILABLE/i.test(code)) return "Genuine video generation isn’t available yet, so I haven’t sent a fake substitute.";
   if (/TOLA_GENUINE_VIDEO_PROVIDER_UNBOUND/i.test(code)) return "Genuine video generation isn’t available yet, so I haven’t sent a fake substitute.";
   if (/TOLA_GENUINE_VIDEO_AUTHORITY_UNBOUND/i.test(code)) return "Genuine video generation needs your approval before I can run it. I haven’t spent anything or sent a fake substitute.";
   if (/TOLA_VIDEO_(?:TEMPORAL|PLAYBACK|CONTAINER|STREAM|ARTIFACT|DOWNLOAD)/i.test(code)) return "A real video was generated, but it failed video or motion validation, so I didn’t send or claim it as complete.";
@@ -421,11 +421,9 @@ class TolaCloudRuntime {
     this.localNodeToken = env.TOLA_LOCAL_NODE_TOKEN || "";
     this.model = env.OPENAI_COMMAND_TOWER_MODEL || "gpt-5.4-mini";
     this.imageModel = env.OPENAI_IMAGE_MODEL || "gpt-image-2.5-flare";
-    this.videoModel = env.TOLA_VIDEO_MODEL || DEFAULT_VIDEO_MODEL;
-    this.imageToVideoModel = env.TOLA_IMAGE_TO_VIDEO_MODEL || "fal-ai/kling-video/v2.6/pro/image-to-video";
-    this.videoKey = env.FAL_KEY || "";
-    this.videoGenerationAuthorized = /^(?:1|true|yes|on)$/i.test(String(env.TOLA_VIDEO_GENERATION_AUTHORIZED || ""));
-    this.videoClient = videoClient || (this.videoKey ? createFalClient({ credentials: this.videoKey }) : null);
+    this.videoProduct = DEFAULT_VIDEO_PRODUCT;
+    this.videoGenerationAuthorized = /^(?:1|true|yes|on)$/i.test(String(env.META_MUSE_VIDEO_GENERATION_AUTHORIZED || ""));
+    this.videoClient = videoClient;
     this.canonRevision = env.CANON_REVISION || "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358";
     this.stateDir = env.TOLA_STATE_DIR || "/tmp/chairman-cloud-state";
     this.store = new CloudStore(this.stateDir);
@@ -437,23 +435,23 @@ class TolaCloudRuntime {
   }
 
   videoAvailability() {
-    if (!this.videoKey && !this.videoClient) {
+    if (!this.videoClient) {
       return {
         available: false,
-        provider: "fal",
-        model: this.videoModel,
-        blocker: "TOLA_GENUINE_VIDEO_PROVIDER_UNBOUND:FAL_KEY",
+        provider: "meta",
+        product: this.videoProduct,
+        blocker: "TOLA_META_MUSE_VIDEO_API_UNAVAILABLE",
       };
     }
     if (!this.videoGenerationAuthorized) {
       return {
         available: false,
-        provider: "fal",
-        model: this.videoModel,
-        blocker: "TOLA_GENUINE_VIDEO_AUTHORITY_UNBOUND:TOLA_VIDEO_GENERATION_AUTHORIZED",
+        provider: "meta",
+        product: this.videoProduct,
+        blocker: "TOLA_GENUINE_VIDEO_AUTHORITY_UNBOUND:META_MUSE_VIDEO_GENERATION_AUTHORIZED",
       };
     }
-    return { available: true, provider: "fal", model: this.videoModel, image_to_video_model: this.imageToVideoModel, blocker: null };
+    return { available: true, provider: "meta", product: this.videoProduct, blocker: null };
   }
 
   publicVideoAvailability() {
@@ -913,41 +911,6 @@ class TolaCloudRuntime {
     return { openai_response_id: body.id, request_sha256: sha256(request) };
   }
 
-  async downloadGeneratedVideo(file) {
-    if (String(file?.content_type || "").toLowerCase() !== "video/mp4") throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_CONTENT_TYPE_INVALID");
-    const declaredSize = Number(file?.file_size);
-    if (Number.isFinite(declaredSize) && (declaredSize <= 0 || declaredSize > MEDIA_LIMITS.video)) throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_SIZE_INVALID");
-    let url;
-    try { url = new URL(file?.url); }
-    catch { throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_URL_INVALID"); }
-    if (url.protocol !== "https:" || url.username || url.password || !(url.hostname === "fal.media" || url.hostname.endsWith(".fal.media"))) {
-      throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_URL_DENIED");
-    }
-    const response = await this.fetch(url, { redirect: "manual", signal: AbortSignal.timeout(180000) });
-    if (response.status >= 300 && response.status < 400) throw new Error("TOLA_VIDEO_DOWNLOAD_REDIRECT_DENIED");
-    if (!response.ok || !response.body?.getReader) throw new Error(`TOLA_VIDEO_DOWNLOAD_${response.status || "FAILED"}`);
-    const reader = response.body.getReader();
-    const chunks = [];
-    let received = 0;
-    try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        const chunk = Buffer.from(value);
-        received += chunk.length;
-        if (received > MEDIA_LIMITS.video || (Number.isFinite(declaredSize) && received > declaredSize)) {
-          await reader.cancel().catch(() => {});
-          throw new Error("TOLA_VIDEO_DOWNLOAD_SIZE_EXCEEDED");
-        }
-        chunks.push(chunk);
-      }
-    } finally {
-      reader.releaseLock?.();
-    }
-    if (!received || (Number.isFinite(declaredSize) && received !== declaredSize)) throw new Error("TOLA_VIDEO_DOWNLOAD_SIZE_MISMATCH");
-    return Buffer.concat(chunks, received);
-  }
-
   async probeVideo(file) {
     let stdout;
     try {
@@ -1071,7 +1034,6 @@ class TolaCloudRuntime {
   async generateGenuineVideo(plan, envelope, source) {
     const availability = this.videoAvailability();
     if (!availability.available) throw new Error(availability.blocker);
-    const model = plan.source_image ? this.imageToVideoModel : this.videoModel;
     const prompt = [
       "Generate a genuine temporally coherent moving scene for this private WANT.",
       "Subject motion must be visible across time. Do not produce a static still, repeated frame, slideshow, Ken Burns effect, or camera-only pan/zoom.",
@@ -1080,37 +1042,42 @@ class TolaCloudRuntime {
     const input = {
       prompt,
       duration: "5",
+      aspect_ratio: "9:16",
       negative_prompt: "static still image, repeated frame, slideshow, Ken Burns effect, camera-only pan, camera-only zoom, watermark, blur, distorted anatomy, low quality",
       generate_audio: false,
+      source_image: plan.source_image ? {
+        mime_type: plan.source_image.mime_type,
+        sha256: plan.source_image.sha256,
+        bytes: Buffer.from(plan.source_image.bytes),
+      } : null,
     };
-    if (plan.source_image) input.start_image_url = `data:${plan.source_image.mime_type};base64,${plan.source_image.bytes.toString("base64")}`;
-    else input.aspect_ratio = "9:16";
-    let generationId = null;
     let generated;
     try {
-      generated = await this.videoClient.subscribe(model, {
-        input,
-        logs: false,
-        onEnqueue: requestId => { generationId = requestId; },
-        abortSignal: AbortSignal.timeout(12 * 60 * 1000),
-      });
+      generated = await this.videoClient.generate(input, { abortSignal: AbortSignal.timeout(12 * 60 * 1000) });
     } catch {
       throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_FAILED");
+    } finally {
+      if (Buffer.isBuffer(input.source_image?.bytes)) input.source_image.bytes.fill(0);
     }
-    generationId = String(generated?.requestId || generationId || "");
-    if (!generationId || !generated?.data?.video) throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_RESULT_INVALID");
-    const providerBytes = await this.downloadGeneratedVideo(generated.data.video);
+    const generationId = String(generated?.generation_id || "");
+    const providerBytes = Buffer.isBuffer(generated?.bytes) ? Buffer.from(generated.bytes) : null;
+    if (!generationId || !providerBytes?.length) throw new Error("TOLA_VIDEO_PROVIDER_GENERATION_RESULT_INVALID");
     try {
       const artifact = await this.validateAndPersistGenuineVideo(providerBytes, source);
       return {
         artifact,
         generation_id: generationId,
-        provider: "fal",
-        model,
-        request_sha256: sha256({ model, input: { ...input, ...(input.start_image_url ? { start_image_url: `data:${plan.source_image.mime_type};sha256,${plan.source_image.sha256}` } : {}) }, A2A_ID: envelope.A2A_ID }),
+        provider: "meta",
+        model: this.videoProduct,
+        request_sha256: sha256({
+          product: this.videoProduct,
+          input: { ...input, source_image: input.source_image ? { mime_type: input.source_image.mime_type, sha256: input.source_image.sha256 } : null },
+          A2A_ID: envelope.A2A_ID,
+        }),
       };
     } finally {
       providerBytes.fill(0);
+      if (Buffer.isBuffer(generated?.bytes)) generated.bytes.fill(0);
     }
   }
 

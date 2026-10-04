@@ -7,7 +7,6 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@fal-ai/client": "^1.10.1",
     "cors": "^2.8.5",
     "csv-parse": "^6.2.1",
     "dotenv": "^16.4.5",

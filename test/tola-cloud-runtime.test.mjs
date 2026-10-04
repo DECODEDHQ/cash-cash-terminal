@@ -71,7 +71,7 @@ test("private inbound replay produces one reasoning call and one reply", async t
   assert.equal(receipt.result.duplicate_execution, false);
 });
 
-test("clear video WANT uses a genuine provider route and replay performs no duplicate work", async t => {
+test("clear video WANT uses the Meta Muse Video contract and replay performs no duplicate work", async t => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-video-"));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
   const videoBytes = Buffer.concat([Buffer.alloc(4), Buffer.from("ftypisom"), Buffer.alloc(1024, 2)]);
@@ -85,9 +85,6 @@ test("clear video WANT uses a genuine provider route and replay performs no dupl
       assert.match(String(request.input), /flying dog/i);
       assert.equal(request.tools, undefined);
       return jsonResponse(200, { id: "resp_private_video_1", output_text: "EXECUTE" });
-    }
-    if (target === "https://v3b.fal.media/files/test/generated.mp4") {
-      return new Response(videoBytes, { status: 200, headers: { "content-type": "video/mp4" } });
     }
     if (target.endsWith("/media") && options.method === "POST") {
       calls.uploads += 1;
@@ -103,17 +100,15 @@ test("clear video WANT uses a genuine provider route and replay performs no dupl
     throw new Error(`unexpected URL ${url}`);
   };
   const videoClient = {
-    subscribe: async (model, options) => {
+    generate: async input => {
       calls.generations += 1;
-      assert.equal(model, "fal-ai/kling-video/v2.6/pro/text-to-video");
-      assert.match(options.input.prompt, /genuine temporally coherent moving scene/i);
-      assert.match(options.input.prompt, /flying dog/i);
-      assert.equal(options.input.aspect_ratio, "9:16");
-      assert.equal(options.input.start_image_url, undefined);
-      options.onEnqueue("fal-generation-private-video-1");
+      assert.match(input.prompt, /genuine temporally coherent moving scene/i);
+      assert.match(input.prompt, /flying dog/i);
+      assert.equal(input.aspect_ratio, "9:16");
+      assert.equal(input.source_image, null);
       return {
-        requestId: "fal-generation-private-video-1",
-        data: { video: { content_type: "video/mp4", file_size: videoBytes.length, url: "https://v3b.fal.media/files/test/generated.mp4" } },
+        generation_id: "meta-muse-generation-private-video-1",
+        bytes: Buffer.from(videoBytes),
       };
     },
   };
@@ -125,7 +120,7 @@ test("clear video WANT uses a genuine provider route and replay performs no dupl
       TOLA_STATE_DIR: stateDir,
       TOLA_WHATSAPP_API_KEY: "test-provider-token",
       OPENAI_API_KEY: "test-openai-token",
-      TOLA_VIDEO_GENERATION_AUTHORIZED: "1",
+      META_MUSE_VIDEO_GENERATION_AUTHORIZED: "1",
       CANON_REVISION: "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358",
     },
   });
@@ -151,8 +146,9 @@ test("clear video WANT uses a genuine provider route and replay performs no dupl
   const source = runtime.store.get(first.job_id);
   assert.equal(source.result.outbound.media_delivery.type, "video");
   assert.equal(source.result.outbound.media_delivery.sha256, sha256(videoBytes));
-  assert.equal(source.result.outbound.media_delivery.generation_id, "fal-generation-private-video-1");
-  assert.equal(source.result.outbound.media_delivery.generation_provider, "fal");
+  assert.equal(source.result.outbound.media_delivery.generation_id, "meta-muse-generation-private-video-1");
+  assert.equal(source.result.outbound.media_delivery.generation_provider, "meta");
+  assert.equal(source.result.outbound.media_delivery.generation_model, "Meta Muse Video");
   assert.equal(source.result.outbound.media_delivery.frame_difference.passed, true);
   assert.equal(source.result.outbound.media_delivery.local_motion_synthesis, false);
   const capabilityReceipt = runtime.store.receipt(source.result.outbound.capability_receipt_id);
@@ -198,7 +194,7 @@ test("video WANT fails closed before image generation when genuine video is unbo
   assert.deepEqual(calls, { openai: 0, uploads: 0, sends: 1 });
   assert.equal(sent.type, "text");
   assert.equal(sent.text.body, "Genuine video generation isn’t available yet, so I haven’t sent a fake substitute.");
-  assert.doesNotMatch(sent.text.body, /FAL_KEY|provider|model|environment|credential/i);
+  assert.doesNotMatch(sent.text.body, /META_MUSE_VIDEO|provider|model|environment|credential/i);
   assert.equal(fs.existsSync(path.join(stateDir, "deliverables", "tola")), false);
   const replay = await runtime.handleMessage("123456", message, []);
   assert.equal(replay.duplicate, true);
@@ -269,11 +265,11 @@ test("TOLA behavior contract precedes capability reasoning and survives restart 
     text: { body: "What can u do" },
   });
   assert.equal(first.duplicate, false);
-  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V4_CUSTOMER_SAFE_BLOCKERS/);
+  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V5_META_MUSE_VIDEO/);
   assert.match(requests[0].instructions, /CURRENT MESSAGE CLASSIFICATION: CAPABILITY QUESTION/);
   assert.match(requests[0].instructions, /Never give a generic capability list/);
-  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V4_CUSTOMER_SAFE_BLOCKERS");
-  assert.doesNotMatch(JSON.stringify(requests[0]), /FAL_KEY|fal-ai|TOLA_GENUINE_VIDEO_PROVIDER_UNBOUND/);
+  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V5_META_MUSE_VIDEO");
+  assert.doesNotMatch(JSON.stringify(requests[0]), /META_MUSE_VIDEO_API|TOLA_META_MUSE_VIDEO_API_UNAVAILABLE/);
   assert.equal(sent[0].text.body, "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.");
   firstRuntime.store.db.close();
 
@@ -335,10 +331,10 @@ test("hydrated image reasoning receives the same TOLA behavior contract", async 
     type: "image",
     image: { id: "media-contract-1", mime_type: "image/jpeg", sha256: digest, caption: "Use this image for the clear WANT." },
   });
-  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V4_CUSTOMER_SAFE_BLOCKERS/);
+  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_EXECUTION_LAW_2026-10-04_V5_META_MUSE_VIDEO/);
   assert.match(openaiRequest.instructions, /CURRENT MESSAGE CLASSIFICATION: WANT OR CONTINUATION/);
   assert.equal(openaiRequest.input[0].content[1].type, "input_image");
-  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V4_CUSTOMER_SAFE_BLOCKERS");
+  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_EXECUTION_LAW_2026-10-04_V5_META_MUSE_VIDEO");
 });
 
 test("a migrated local receipt suppresses a pre-cloud provider replay", async t => {
