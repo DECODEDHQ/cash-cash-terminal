@@ -38,6 +38,19 @@ const MEDIA_LIMITS = Object.freeze({
 });
 const DEFAULT_REPLY = "Tell me what you want. I’ll work out the rest.";
 const CAPABILITY_REPLY = "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.";
+const TOLA_BEHAVIOR_CONTRACT_REVISION = "TOLA_RESPONSE_LAW_2026-10-04";
+const TOLA_BEHAVIOR_CONTRACT = [
+  `TOLA BEHAVIOR CONTRACT ${TOLA_BEHAVIOR_CONTRACT_REVISION}. This contract applies to every WhatsApp response and takes priority over generic assistant behavior.`,
+  "TOLA is a human-facing execution agent, not a generic chatbot. Speak as TOLA and return only the direct WhatsApp reply.",
+  `For a capability question, answer exactly: “${CAPABILITY_REPLY}”`,
+  "Never give a generic capability list. Never say that you can answer questions, summarize, translate, draft, write or rewrite text, look things up, or that you are an AI assistant.",
+  "Never say ‘if you want, I can’. Never advertise tools, models, engines, integrations, menus, or internal architecture.",
+  "When the user supplies a clear WANT and enough information exists: understand it, resolve the required steps internally, act within current authority, continue until a result or genuine blocker, and return the result.",
+  "Do not offer options, plans, prompts, briefs, storyboards, or other intermediate artifacts instead of executing a clear WANT.",
+  "Ask one short question only when information, identity, consent, payment, authentication, rights, legal approval, material authority, or another genuine dependency is missing.",
+  "Use short WhatsApp-native language: direct acknowledgment, action, result, and at most one necessary question. Do not use email formatting, long signatures, or infrastructure explanations.",
+  "Never claim a consequential external action occurred unless verified evidence in the current request proves it occurred.",
+].join("\n");
 
 const now = () => new Date().toISOString();
 const parse = (value, fallback = null) => {
@@ -106,8 +119,23 @@ function isOpening(value) {
 }
 
 function isCapabilityQuestion(value) {
-  const text = String(value || "").trim().toLowerCase().replace(/[^a-z0-9' ]+/g, " ").replace(/\s+/g, " ");
-  return text.length <= 220 && /^(?:so )?(?:what can you do|what are you able to do|can you help me|can you actually do things for me|how can you help)(?: for me)?$/.test(text);
+  const text = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9' ]+/g, " ")
+    .replace(/\bu\b/g, "you")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length <= 220 && /^(?:(?:so|ok|okay) )?(?:what can you do|what do you do|what are you able to do|can you help me|can you actually do things(?: for me)?|how can you help(?: me)?)(?: please)?$/.test(text);
+}
+
+function tolaInstructions(intent) {
+  const classification = isCapabilityQuestion(intent)
+    ? `CURRENT MESSAGE CLASSIFICATION: CAPABILITY QUESTION. The entire reply must be exactly: “${CAPABILITY_REPLY}”`
+    : isOpening(intent)
+      ? `CURRENT MESSAGE CLASSIFICATION: OPENING. Reply briefly in TOLA's WANT-first posture: “${DEFAULT_REPLY}”`
+      : "CURRENT MESSAGE CLASSIFICATION: WANT OR CONTINUATION. Perform the available work now; do not replace execution with a capability speech or an offer of next steps.";
+  return `${TOLA_BEHAVIOR_CONTRACT}\n${classification}`;
 }
 
 function normalizeReply(value, fallback = DEFAULT_REPLY) {
@@ -673,6 +701,7 @@ class TolaCloudRuntime {
       model: this.model,
       store: true,
       instructions: [
+        tolaInstructions(source.intent),
         "You are OPENAI_COMMAND_TOWER_RUNTIME behind TOLA WhatsApp.",
         "Return only TOLA's direct human-facing reply. Never expose internal architecture, engines, models, A2A, PAI, CHAIRMAN, Muse, or OpenAI.",
         "TOLA is not a generic chatbot. Follow UNDERSTAND -> ROUTE -> EXECUTE WITHIN AUTHORITY -> RETURN RESULT.",
@@ -684,7 +713,13 @@ class TolaCloudRuntime {
       ].join(" "),
       input,
       tools: [{ type: "web_search" }],
-      metadata: { a2a_id: envelope.A2A_ID, opportunity_id: envelope.OPPORTUNITY_ID, producer: envelope.producer_identity, canon_revision: sha256(envelope.CANON_REVISION) },
+      metadata: {
+        a2a_id: envelope.A2A_ID,
+        opportunity_id: envelope.OPPORTUNITY_ID,
+        producer: envelope.producer_identity,
+        canon_revision: sha256(envelope.CANON_REVISION),
+        tola_contract_revision: TOLA_BEHAVIOR_CONTRACT_REVISION,
+      },
     };
     if (previousResponseId) request.previous_response_id = previousResponseId;
     const response = await this.fetch(OPENAI_URL, { method: "POST", headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json" }, body: JSON.stringify(request), signal: AbortSignal.timeout(90000) });
@@ -705,7 +740,19 @@ class TolaCloudRuntime {
         terminal_state: "EXECUTED",
         terminal_evidence: { executor_invoked: "OPENAI_COMMAND_TOWER_RUNTIME", authority_result: "REASONING_ONLY_ALLOWED", external_action_performed: "NONE_REASONING_RESULT_ONLY", downstream_effects_authorized: false },
       },
-      evidence: [{ type: "A2A_OPENAI_RESPONSES_RESULT", verified: true, openai_response_id: body.id, previous_response_id: previousResponseId, model: this.model, media_supplied: ["OPENAI_INPUT_IMAGE", "OPENAI_INPUT_FILE"].includes(media?.processing_path), request_sha256: sha256(request), at: now() }],
+      evidence: [{
+        type: "A2A_OPENAI_RESPONSES_RESULT",
+        verified: true,
+        openai_response_id: body.id,
+        previous_response_id: previousResponseId,
+        model: this.model,
+        media_supplied: ["OPENAI_INPUT_IMAGE", "OPENAI_INPUT_FILE"].includes(media?.processing_path),
+        tola_contract_revision: TOLA_BEHAVIOR_CONTRACT_REVISION,
+        tola_contract_sha256: sha256(TOLA_BEHAVIOR_CONTRACT),
+        capability_question: isCapabilityQuestion(source.intent),
+        request_sha256: sha256(request),
+        at: now(),
+      }],
     };
   }
 

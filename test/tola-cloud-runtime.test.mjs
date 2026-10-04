@@ -70,6 +70,118 @@ test("private inbound replay produces one reasoning call and one reply", async t
   assert.equal(receipt.result.duplicate_execution, false);
 });
 
+test("TOLA behavior contract precedes capability reasoning and survives restart continuity", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-contract-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const requests = [];
+  const sent = [];
+  const fetchImpl = async (url, options = {}) => {
+    if (String(url).includes("api.openai.com/v1/responses")) {
+      const request = JSON.parse(options.body);
+      requests.push(request);
+      return jsonResponse(200, {
+        id: `resp_contract_${requests.length}`,
+        output_text: "I can answer questions, summarize, translate, and draft messages.",
+      });
+    }
+    if (String(url).endsWith("/messages")) {
+      const request = JSON.parse(options.body);
+      sent.push(request);
+      return jsonResponse(200, {
+        contacts: [{ wa_id: request.to }],
+        messages: [{ id: `wamid.contract-out-${sent.length}` }],
+      });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  };
+  const env = {
+    TOLA_CLOUD_ENABLED: "0",
+    TOLA_STATE_DIR: stateDir,
+    TOLA_WHATSAPP_API_KEY: "test-provider-token",
+    OPENAI_API_KEY: "test-openai-token",
+    TOLA_CLOUD_ADMIN_TOKEN: "test-admin-token",
+    TOLA_LOCAL_NODE_TOKEN: "test-local-token",
+    CANON_REVISION: "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358",
+  };
+  const firstRuntime = new TolaCloudRuntime({ app: {}, fetchImpl, env });
+  const first = await firstRuntime.handleMessage("123456", {
+    id: "wamid.capability-u-1",
+    from: "user:15550001111",
+    type: "text",
+    text: { body: "What can u do" },
+  });
+  assert.equal(first.duplicate, false);
+  assert.match(requests[0].instructions, /TOLA BEHAVIOR CONTRACT TOLA_RESPONSE_LAW_2026-10-04/);
+  assert.match(requests[0].instructions, /CURRENT MESSAGE CLASSIFICATION: CAPABILITY QUESTION/);
+  assert.match(requests[0].instructions, /Never give a generic capability list/);
+  assert.equal(requests[0].metadata.tola_contract_revision, "TOLA_RESPONSE_LAW_2026-10-04");
+  assert.equal(sent[0].text.body, "Tell me the result you want. I’ll work out what needs to happen and take it from there. If I need anything from you, I’ll ask.");
+  firstRuntime.store.db.close();
+
+  const restartedRuntime = new TolaCloudRuntime({ app: {}, fetchImpl, env });
+  const afterRestart = await restartedRuntime.handleMessage("123456", {
+    id: "wamid.capability-u-2",
+    from: "user:15550001111",
+    type: "text",
+    text: { body: "What do u do?" },
+  });
+  assert.equal(afterRestart.duplicate, false);
+  assert.equal(requests[1].previous_response_id, "resp_contract_1");
+  assert.match(requests[1].instructions, /CURRENT MESSAGE CLASSIFICATION: CAPABILITY QUESTION/);
+  assert.equal(sent[1].text.body, sent[0].text.body);
+  restartedRuntime.store.db.close();
+});
+
+test("hydrated image reasoning receives the same TOLA behavior contract", async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-media-contract-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const bytes = Buffer.from("image-fixture");
+  const digest = sha256(bytes);
+  let openaiRequest = null;
+  const fetchImpl = async (url, options = {}) => {
+    const target = String(url);
+    if (target.includes("/media/media-contract-1")) return jsonResponse(200, {
+      mime_type: "image/jpeg",
+      file_size: bytes.length,
+      sha256: digest,
+      url: "https://cdn.whatsapp.net/media-contract-1",
+    });
+    if (target === "https://cdn.whatsapp.net/media-contract-1") return new Response(bytes, {
+      status: 200,
+      headers: { "content-length": String(bytes.length) },
+    });
+    if (target.includes("api.openai.com/v1/responses")) {
+      openaiRequest = JSON.parse(options.body);
+      return jsonResponse(200, { id: "resp_media_contract_1", output_text: "I inspected the supplied image." });
+    }
+    if (target.endsWith("/messages")) return jsonResponse(200, {
+      contacts: [{ wa_id: "user:15550001111" }],
+      messages: [{ id: "wamid.media-contract-out" }],
+    });
+    throw new Error(`unexpected URL ${url}`);
+  };
+  const runtime = new TolaCloudRuntime({
+    app: {},
+    fetchImpl,
+    env: {
+      TOLA_STATE_DIR: stateDir,
+      TOLA_WHATSAPP_API_KEY: "test-provider-token",
+      OPENAI_API_KEY: "test-openai-token",
+      CANON_REVISION: "CANON_SHA256:5005421761af682b1b623b43e5d04f3cb38fe9084d72ab18226b5987cc88a358",
+    },
+  });
+  await runtime.handleMessage("123456", {
+    id: "wamid.media-contract-in",
+    from: "user:15550001111",
+    type: "image",
+    image: { id: "media-contract-1", mime_type: "image/jpeg", sha256: digest, caption: "Use this image for the clear WANT." },
+  });
+  assert.match(openaiRequest.instructions, /TOLA BEHAVIOR CONTRACT TOLA_RESPONSE_LAW_2026-10-04/);
+  assert.match(openaiRequest.instructions, /CURRENT MESSAGE CLASSIFICATION: WANT OR CONTINUATION/);
+  assert.equal(openaiRequest.input[0].content[1].type, "input_image");
+  assert.equal(openaiRequest.metadata.tola_contract_revision, "TOLA_RESPONSE_LAW_2026-10-04");
+});
+
 test("a migrated local receipt suppresses a pre-cloud provider replay", async t => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tola-cloud-migrated-replay-"));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
